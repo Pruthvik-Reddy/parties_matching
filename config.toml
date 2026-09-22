@@ -1,0 +1,64 @@
+[account]
+id = "poc-account"
+
+[paths]
+prepared_dir = "data/prepared"
+state_dir = "state"
+artifacts_dir = "artifacts"
+outputs_dir = "outputs"
+prompt = "prompts/party_expansion_v1.txt"
+
+[workbook]
+detail_sheet = "Detail"
+raw_name_column = "Raw Name (original)"
+canonical_name_column = "Resolved (Canonical) Name"
+category_column = "Category"
+
+[expansion]
+mode = "off" # off | cache_only | azure
+version = "v2"
+batch_size = 10
+workers = 4
+timeout_seconds = 30
+max_retries = 2
+minimum_candidate_confidence = 0.70
+minimum_parent_confidence = 0.85
+
+[retrieval]
+lexical_top_k = 100
+embedding_top_k = 100
+lexical_min_score = 0.28
+embedding_min_score = 0.42
+embedding_enabled = false
+embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
+embedding_model_path = ""
+ann_backend = "usearch" # usearch | brute
+
+[matching]
+strategy = "selective_hybrid" # feature | selective_hybrid
+cross_encoder_mode = "ambiguous" # off | ambiguous | all_shortlisted
+cross_encoder_model = "cross-encoder/ms-marco-MiniLM-L6-v2"
+ambiguous_low = 0.55
+ambiguous_high = 0.98
+ambiguous_margin = 0.08
+rerank_top_k = 5
+minimum_root_margin = 0.04
+
+[decision]
+precision_target = 0.98
+request_confidence_cutoff = 0.0
+fallback_system_threshold = 0.90
+minimum_calibration_matches = 100
+
+[execution]
+mode = "parallel" # serial | parallel
+workers = 10
+native_threads = 10
+seed = 42
+
+[training]
+max_identity_pairs = 100000
+negative_ratio = 3
+train_cross_encoder = false
+cross_encoder_epochs = 1
+cross_encoder_batch_size = 32
