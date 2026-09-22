@@ -15,6 +15,7 @@ dependencies = [
   "scikit-learn>=1.5,<2",
   "rapidfuzz>=3.9,<4",
   "joblib>=1.4,<2",
+  "sparse-dot-topn>=1.2,<2",
 ]
 
 [project.optional-dependencies]

@@ -35,8 +35,12 @@ def main() -> None:
     metrics = build_reports(config.get("paths", {}).get("prepared_dir", "data/prepared"), output, stats)
     overall = metrics["overall"]
     precision = "n.a." if overall["precision"] is None else f"{overall['precision']:.2%}"
+    recall = "n.a." if overall["recall"] is None else f"{overall['recall']:.2%}"
     print(f"Wrote {output.resolve()}")
-    print(f"Rows={overall['rows']:,} matches={overall['matches']:,} precision={precision} runtime={stats['total_seconds']:.2f}s")
+    print(
+        f"Rows={overall['rows']:,} matches={overall['matches']:,} "
+        f"precision={precision} recall={recall} runtime={stats['total_seconds']:.2f}s"
+    )
 
 
 if __name__ == "__main__":

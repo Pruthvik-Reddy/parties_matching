@@ -25,7 +25,11 @@ minimum_candidate_confidence = 0.70
 minimum_parent_confidence = 0.85
 
 [retrieval]
-lexical_top_k = 100
+# These caps limit competing verified roots per ADM mention, not the number of
+# ADM rows that may match one verified party.
+max_roots_per_mention = 50
+max_variants_per_root = 2
+identity_batch_size = 50000
 embedding_top_k = 100
 lexical_min_score = 0.28
 embedding_min_score = 0.42
@@ -43,6 +47,7 @@ ambiguous_high = 0.98
 ambiguous_margin = 0.08
 rerank_top_k = 5
 minimum_root_margin = 0.04
+confidence_batch_size = 50000
 
 [decision]
 precision_target = 0.98

@@ -114,6 +114,8 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
             "precision": len(correct) / len(matches) if matches else None,
             "precision_ci_95_low": interval[0],
             "precision_ci_95_high": interval[1],
+            "recall": len(correct) / len(scorable) if scorable else None,
+            # Backward-compatible alias for any existing consumers of metrics.json.
             "correct_match_recall": len(correct) / len(scorable) if scorable else None,
             "coverage": len(matches) / len(scorable) if scorable else None,
             "retrieval_recall": len(retrieved) / len(scorable) if scorable else None,
@@ -199,7 +201,7 @@ def _write_workbook(
         ("Precision", overall["precision"], percent),
         ("Precision 95% CI low", overall["precision_ci_95_low"], percent),
         ("Precision 95% CI high", overall["precision_ci_95_high"], percent),
-        ("Correct-match recall", overall["correct_match_recall"], percent),
+        ("Recall", overall["recall"], percent),
         ("Coverage", overall["coverage"], percent),
         ("Retrieval recall", overall["retrieval_recall"], percent),
         ("Matching runtime (seconds)", run_stats.get("total_seconds"), decimal),
@@ -215,24 +217,24 @@ def _write_workbook(
 
     split_start = 20
     _section_band(summary, split_start, 0, 8, "Metrics by dataset split", section)
-    split_headers = ["Split", "Rows", "Scorable", "Matches", "Correct", "Precision", "Correct recall", "Coverage", "Retrieval recall"]
+    split_headers = ["Split", "Rows", "Scorable", "Matches", "Correct", "Precision", "Recall", "Coverage", "Retrieval recall"]
     summary.write_row(split_start + 1, 0, split_headers, header)
     for row_number, (split, values) in enumerate(metrics["by_split"].items(), start=split_start + 2):
         summary.write(row_number, 0, split, text)
         for column, key in enumerate(("rows", "scorable", "matches", "correct_matches"), start=1):
             summary.write(row_number, column, values[key], integer)
-        for column, key in enumerate(("precision", "correct_match_recall", "coverage", "retrieval_recall"), start=5):
+        for column, key in enumerate(("precision", "recall", "coverage", "retrieval_recall"), start=5):
             if values[key] is not None:
                 summary.write(row_number, column, values[key], percent)
 
     case_start = split_start + 4 + len(metrics["by_split"])
     _section_band(summary, case_start, 0, 8, "Metrics by case type", section)
-    summary.write_row(case_start + 1, 0, ["Case type", "Rows", "Scorable", "Matches", "Correct", "Precision", "Correct recall", "Coverage", "Retrieval recall"], header)
+    summary.write_row(case_start + 1, 0, ["Case type", "Rows", "Scorable", "Matches", "Correct", "Precision", "Recall", "Coverage", "Retrieval recall"], header)
     for row_number, (case, values) in enumerate(metrics["by_case"].items(), start=case_start + 2):
         summary.write(row_number, 0, case, text)
         for column, key in enumerate(("rows", "scorable", "matches", "correct_matches"), start=1):
             summary.write(row_number, column, values[key], integer)
-        for column, key in enumerate(("precision", "correct_match_recall", "coverage", "retrieval_recall"), start=5):
+        for column, key in enumerate(("precision", "recall", "coverage", "retrieval_recall"), start=5):
             if values[key] is not None:
                 summary.write(row_number, column, values[key], percent)
 
@@ -338,7 +340,7 @@ def _write_analysis(path: Path, metrics: dict[str, Any], run_stats: dict[str, An
         f"- Rows: {overall['rows']}",
         f"- Scorable rows: {overall['scorable']}",
         f"- Match precision: {_display_rate(overall['precision'])}",
-        f"- Correct-match recall: {_display_rate(overall['correct_match_recall'])}",
+        f"- Recall: {_display_rate(overall['recall'])}",
         f"- Coverage: {_display_rate(overall['coverage'])}",
         f"- Retrieval recall: {_display_rate(overall['retrieval_recall'])}",
         f"- Matching runtime: {float(run_stats.get('total_seconds', 0)):.2f} seconds",

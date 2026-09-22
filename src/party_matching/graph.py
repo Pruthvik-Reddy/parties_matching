@@ -28,6 +28,8 @@ class VerifiedGraph:
         self.nodes: dict[str, VerifiedNode] = {}
         self.pending_parent_ids: set[str] = set()
         self._candidate_owners: dict[str, set[str]] = {}
+        self._official_owners: dict[str, set[str]] = {}
+        self._dirty = False
         if load_existing:
             self._load()
 
@@ -44,30 +46,40 @@ class VerifiedGraph:
         self._rebuild_indexes()
 
     def save(self) -> None:
+        if not self._dirty and self.path.exists():
+            return
         write_json(self.path, {
             "schema_version": self.schema_version,
             "account_id": self.account_id,
             "nodes": [asdict(self.nodes[key]) for key in sorted(self.nodes)],
         })
+        self._dirty = False
 
     def add_parties(self, parties: Iterable[dict[str, str]]) -> list[str]:
         added: list[str] = []
+        changed = False
         for party in parties:
             party_id, party_name = str(party["partyId"]), str(party["partyName"]).strip()
             if party_id in self.nodes:
                 if self.nodes[party_id].party_name != party_name:
                     self.nodes[party_id].party_name = party_name
+                    changed = True
                 continue
             self.nodes[party_id] = VerifiedNode(party_id=party_id, party_name=party_name)
             added.append(party_id)
-        self._rebuild_indexes()
+            changed = True
+        if changed:
+            self._dirty = True
+            self._rebuild_indexes()
         return added
 
     def apply_expansions(self, entities: Iterable[dict[str, Any]]) -> None:
+        changed = False
         for entity in entities:
             node = self.nodes.get(str(entity.get("party_id", "")))
             if not node:
                 continue
+            changed = True
             seen: set[str] = set()
             candidates: list[ExpansionCandidate] = []
             for item in entity.get("match_candidates", []):
@@ -95,14 +107,12 @@ class VerifiedGraph:
             elif not node.parent_id:
                 node.suggested_parent = None
                 self.pending_parent_ids.discard(node.party_id)
-        self._rebuild_indexes()
+        if changed:
+            self._dirty = True
+            self._rebuild_indexes()
 
     def reconcile_suggested_parents(self) -> list[dict[str, Any]]:
         """Resolve only unique deterministic official/base-name matches."""
-        official: dict[str, set[str]] = {}
-        for node in self.nodes.values():
-            for key in {normalize_name(node.party_name), base_name(node.party_name)} - {""}:
-                official.setdefault(key, set()).add(node.party_id)
         updates: list[dict[str, Any]] = []
         for child_id in sorted(self.pending_parent_ids):
             child = self.nodes.get(child_id)
@@ -111,7 +121,7 @@ class VerifiedGraph:
             suggested = child.suggested_parent["name"]
             matches = set()
             for key in {normalize_name(suggested), base_name(suggested)} - {""}:
-                matches.update(official.get(key, set()))
+                matches.update(self._official_owners.get(key, set()))
             matches.discard(child_id)
             if len(matches) != 1:
                 continue
@@ -119,6 +129,7 @@ class VerifiedGraph:
             if self._would_cycle(child_id, parent_id):
                 continue
             child.parent_id = parent_id
+            self._dirty = True
             child.parent_evidence = {
                 "method": "unique_normalized_official_name",
                 "suggested_name": suggested,
@@ -178,7 +189,10 @@ class VerifiedGraph:
 
     def _rebuild_indexes(self) -> None:
         self._candidate_owners = {}
+        self._official_owners = {}
         for node in self.nodes.values():
+            for key in {normalize_name(node.party_name), base_name(node.party_name)} - {""}:
+                self._official_owners.setdefault(key, set()).add(node.party_id)
             for name, _, _, _ in self.variants(node.party_id):
                 key = normalize_name(name)
                 if key:
