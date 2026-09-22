@@ -1,6 +1,6 @@
 # Verified-party matching POC
 
-This local POC derives an ADM-shaped dataset from the `related-parties` workbook, builds a persistent verified-party graph, searches ADM records from every verified name and expansion, resolves competition at the global root, and writes events plus a complete prediction workbook.
+This local POC derives an ADM-shaped dataset from the `related-parties` workbook, builds a persistent verified-party graph, retrieves ADM records with exact, word TF-IDF, character TF-IDF and optional embedding indexes, resolves competition at the global root, and writes events plus a complete prediction workbook.
 
 ## Setup
 
@@ -45,6 +45,14 @@ python scripts/train.py
 python scripts/run.py --mode parallel --fresh-state
 ```
 
+After copying this source update onto a laptop that already has the same prepared workbook, rerun installation and training, then make a fresh evaluation run. Training now calculates word/character TF-IDF features using the same definitions as matching. `prepare.py` is only needed again if the workbook or preparation settings changed.
+
+```bash
+python -m pip install .
+python scripts/train.py
+python scripts/run.py --mode parallel --fresh-state --output outputs/exp3
+```
+
 Use `--limit 1000` for a quick prefix sample or `--ids-file adm_ids.txt` for a targeted set of ADM IDs.
 
 Add `--cross-encoder` to training only after the feature baseline works. Set `[expansion].mode = "azure"` and populate `.env` to call Azure OpenAI. `cache_only` reuses prior expansions without network calls. The LLM receives official names plus temporary request references; authoritative party IDs are attached locally and never supplied by the model.
@@ -56,7 +64,9 @@ Each run writes:
 - `events.jsonl`: API-shaped accepted mapping events.
 - `decisions.jsonl`: every decision and its evidence.
 - `predictions.xlsx`: complete `Summary` and `Detail` sheets.
-- `run_metrics.json`, `run_stats.json`, and `analysis.md`.
+- `run_metrics.json`: full held-out, split, case and confidence metrics.
+- `diagnostics.json`: compact retrieval funnel, connector cohorts and error buckets.
+- `run_stats.json` and `analysis.md`.
 
 Evaluation should use `--fresh-state`. Incremental runs omit that flag and reuse `state/<account>/graph.json` plus `mappings.jsonl`.
 
@@ -67,6 +77,10 @@ Evaluation should use `--fresh-state`. Incremental runs omit that flag and reuse
 - Low-confidence LLM candidates and parents are discarded using the configurable expansion thresholds.
 - OBO and via mentions are matched independently; no connector direction is assumed.
 - Proposals are grouped by global root before distinct roots compete.
+- Retrieval is bounded by `max_roots_per_mention` and `max_variants_per_root`; cap-hit statistics are written to diagnostics.
+- Headline precision and recall use only untouched `TEST_KNOWN` and `TEST_UNSEEN` rows. Training and calibration results remain visible but are not mixed into the headline.
+- Evaluation resolves each workbook canonical label through the verified graph before comparing it with the emitted global parent.
+- OBO/VIA, no-OBO, no-VIA and plain-name cohorts are reported separately.
 - `UNKNOWN` rows appear in predictions but not supervised metrics.
 - Rows that already have a verified parent remain in predictions, but are excluded from matching, training, and supervised metrics.
 - The matcher never reads `labels.jsonl`; only reporting and training do.

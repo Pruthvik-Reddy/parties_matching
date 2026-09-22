@@ -15,21 +15,23 @@ import joblib
 import numpy as np
 from sparse_dot_topn import sp_matmul_topn
 if os.getenv("PARTY_MATCHING_DISABLE_SKLEARN", "").casefold() in {"1", "true", "yes"}:
-    HistGradientBoostingClassifier = TfidfVectorizer = LogisticRegression = NearestNeighbors = None
+    HistGradientBoostingClassifier = TfidfVectorizer = IsotonicRegression = LogisticRegression = NearestNeighbors = None
     SKLEARN_ERROR = "disabled by PARTY_MATCHING_DISABLE_SKLEARN"
 else:
   try:
     from sklearn.ensemble import HistGradientBoostingClassifier
     from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.isotonic import IsotonicRegression
     from sklearn.linear_model import LogisticRegression
     from sklearn.neighbors import NearestNeighbors
     SKLEARN_ERROR = None
   except Exception as exc:  # permits exact/brute smoke runs on restricted machines
-    HistGradientBoostingClassifier = TfidfVectorizer = LogisticRegression = NearestNeighbors = None
+    HistGradientBoostingClassifier = TfidfVectorizer = IsotonicRegression = LogisticRegression = NearestNeighbors = None
     SKLEARN_ERROR = str(exc)
 
 from .domain import (
     FinalDecision,
+    LEGAL_SUFFIXES,
     MatchProposal,
     OrganizationMention,
     PartyRecord,
@@ -47,10 +49,14 @@ from .graph import VerifiedGraph
 
 
 IDENTITY_FEATURES = [
-    "exact", "base_exact", "compact_exact", "char_ratio", "token_jaccard",
-    "weighted_token_overlap", "token_containment", "digit_conflict", "length_ratio",
-    "lexical_score", "embedding_score", "official", "abbreviation", "collision_penalty",
+    "exact", "base_exact", "compact_exact", "char_ratio", "jaro_winkler",
+    "levenshtein", "token_jaccard", "raw_coverage", "candidate_coverage",
+    "weighted_token_overlap", "weighted_candidate_coverage", "digit_conflict",
+    "distinctive_token_conflict", "length_ratio", "char_tfidf", "word_tfidf",
+    "rrf_score", "embedding_score", "official", "abbreviation", "collision_penalty",
+    "acronym_relation", "legal_suffix_only_difference",
 ]
+FEATURE_INDEX = {name: index for index, name in enumerate(IDENTITY_FEATURES)}
 TARGET_FEATURES = [
     "identity", "cross_encoder", "has_cross_encoder", "runner_up_identity",
     "identity_margin", "exact", "collision_penalty", "supporting_mentions", "graph_depth",
@@ -67,12 +73,24 @@ class MentionRetriever:
         for index, mention in enumerate(self.mentions):
             if mention.normalized:
                 self.exact[mention.normalized].append(index)
-        self.vectorizer: TfidfVectorizer | None = None
-        self.lexical_matrix = None
+        self.char_vectorizer: TfidfVectorizer | None = None
+        self.char_matrix = None
+        self.word_vectorizer: TfidfVectorizer | None = None
+        self.word_matrix = None
         texts = [mention.text for mention in self.mentions]
         if texts and SKLEARN_ERROR is None:
-            self.vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1, dtype=np.float32)
-            self.lexical_matrix = self.vectorizer.fit_transform(texts)
+            if bool(config.get("char_tfidf_enabled", True)):
+                self.char_vectorizer = TfidfVectorizer(
+                    analyzer="char_wb", ngram_range=(3, 5), min_df=1,
+                    sublinear_tf=True, dtype=np.float32,
+                )
+                self.char_matrix = self.char_vectorizer.fit_transform(texts)
+            if bool(config.get("word_tfidf_enabled", True)):
+                self.word_vectorizer = TfidfVectorizer(
+                    analyzer="word", ngram_range=(1, 2), min_df=1,
+                    sublinear_tf=True, dtype=np.float32,
+                )
+                self.word_matrix = self.word_vectorizer.fit_transform(texts)
         self.embedding_model = None
         self.embedding_matrix: np.ndarray | None = None
         self.ann_index = None
@@ -115,43 +133,65 @@ class MentionRetriever:
             self.embedding_matrix = None
 
     def retrieve_top_candidates(self, queries: list[str], top_n: int) -> dict[int, dict[int, dict[str, Any]]]:
-        """Return bounded verified-query candidates for each indexed ADM mention."""
+        """Return hybrid, bounded verified-query candidates for each ADM mention."""
         by_mention: dict[int, dict[int, dict[str, Any]]] = defaultdict(dict)
         query_norms = [normalize_name(query) for query in queries]
+
+        def empty_hit() -> dict[str, Any]:
+            return {
+                "sources": set(), "exact": 0.0, "lexical": 0.0,
+                "char": 0.0, "word": 0.0, "rrf": 0.0, "embedding": None,
+            }
+
         for query_index, normalized in enumerate(query_norms):
             for mention_index in self.exact.get(normalized, []):
-                by_mention[mention_index][query_index] = {
-                    "sources": {"exact", "lexical"},
-                    "exact": 1.0,
-                    "lexical": 1.0,
-                    "embedding": None,
-                }
-        if self.lexical_matrix is not None and queries:
-            query_matrix = self.vectorizer.transform(queries)
+                hit = empty_hit()
+                hit.update({
+                    "sources": {"exact"}, "exact": 1.0,
+                    "char": float(self.char_matrix is not None),
+                    "word": float(self.word_matrix is not None),
+                    "lexical": float(self.char_matrix is not None or self.word_matrix is not None),
+                })
+                by_mention[mention_index][query_index] = hit
+
+        def add_sparse(source: str, matrix: Any, vectorizer: Any, minimum: float) -> None:
+            if matrix is None or vectorizer is None or not queries:
+                return
+            query_matrix = vectorizer.transform(queries)
             similarities = sp_matmul_topn(
-                self.lexical_matrix,
+                matrix,
                 query_matrix.T.tocsr(),
                 top_n=max(1, int(top_n)),
-                threshold=float(self.config.get("lexical_min_score", 0.28)),
+                threshold=minimum,
                 sort=True,
                 n_threads=max(1, self.workers),
             )
             for mention_index in range(similarities.shape[0]):
                 first, last = similarities.indptr[mention_index:mention_index + 2]
-                for query_index, score_value in zip(
+                for rank, (query_index, score_value) in enumerate(zip(
                     similarities.indices[first:last], similarities.data[first:last],
-                ):
+                ), start=1):
                     query_index = int(query_index)
-                    hit = by_mention[mention_index].setdefault(query_index, {
-                        "sources": set(), "exact": 0.0, "lexical": 0.0, "embedding": None,
-                    })
-                    hit["sources"].add("lexical")
-                    hit["lexical"] = max(hit["lexical"], float(score_value))
+                    score = max(0.0, min(1.0, float(score_value)))
+                    hit = by_mention[mention_index].setdefault(query_index, empty_hit())
+                    hit["sources"].add(source)
+                    hit[source] = max(float(hit[source]), score)
+                    hit["lexical"] = max(float(hit["lexical"]), score)
+                    if bool(self.config.get("rrf_enabled", True)):
+                        hit["rrf"] += 1.0 / (float(self.config.get("rrf_k", 60)) + rank)
                     if self.mentions[mention_index].normalized == query_norms[query_index]:
                         hit["sources"].add("exact")
                         hit["exact"] = 1.0
-        elif queries and len(self.mentions) > 5_000:
-            raise RuntimeError(f"scikit-learn is required for more than 5,000 mentions: {SKLEARN_ERROR}")
+
+        if queries and (self.char_matrix is not None or self.word_matrix is not None):
+            add_sparse(
+                "char", self.char_matrix, self.char_vectorizer,
+                float(self.config.get("char_min_score", self.config.get("lexical_min_score", 0.28))),
+            )
+            add_sparse(
+                "word", self.word_matrix, self.word_vectorizer,
+                float(self.config.get("word_min_score", 0.18)),
+            )
         if self.embedding_model is not None and self.embedding_matrix is not None and queries:
             count = min(max(1, int(self.config.get("embedding_top_k", 100))), len(self.mentions))
             minimum = float(self.config.get("embedding_min_score", 0.42))
@@ -160,36 +200,35 @@ class MentionRetriever:
                     queries[start:start + 128], batch_size=128, normalize_embeddings=True,
                     convert_to_numpy=True, show_progress_bar=False,
                 ).astype(np.float32)
-                touched: set[int] = set()
                 for local_index, vector in enumerate(vectors):
                     query_index = start + local_index
                     if self.ann_index is not None:
                         matches = self.ann_index.search(vector, count=count)
                         keys = np.atleast_1d(matches.keys)
-                        similarities = 1.0 - np.atleast_1d(matches.distances)
+                        scores = 1.0 - np.atleast_1d(matches.distances)
                     else:
                         all_scores = self.embedding_matrix @ vector
                         keys = np.argpartition(all_scores, -count)[-count:]
-                        similarities = all_scores[keys]
-                    for mention_index, score_value in zip(keys, similarities):
-                        score = float(score_value)
+                        scores = all_scores[keys]
+                    for mention_index, score_value in zip(keys, scores):
+                        score = max(-1.0, min(1.0, float(score_value)))
                         if score < minimum:
                             continue
-                        mention_index = int(mention_index)
-                        hit = by_mention[mention_index].setdefault(query_index, {
-                            "sources": set(), "exact": 0.0, "lexical": 0.0, "embedding": None,
-                        })
+                        hit = by_mention[int(mention_index)].setdefault(query_index, empty_hit())
                         hit["sources"].add("embedding")
                         hit["embedding"] = max(hit["embedding"] or -1.0, score)
-                        touched.add(mention_index)
-                for mention_index in touched:
-                    hits = by_mention[mention_index]
-                    exact = {key: value for key, value in hits.items() if value["exact"]}
-                    ranked = sorted(
-                        ((key, value) for key, value in hits.items() if key not in exact),
-                        key=lambda item: -max(item[1]["lexical"], item[1]["embedding"] or 0.0),
-                    )[:max(1, int(top_n))]
-                    by_mention[mention_index] = {**dict(ranked), **exact}
+
+        for mention_index, hits in tuple(by_mention.items()):
+            exact = {key: value for key, value in hits.items() if value["exact"]}
+            ranked = sorted(
+                ((key, value) for key, value in hits.items() if key not in exact),
+                key=lambda item: (
+                    -float(item[1]["rrf"]),
+                    -max(float(item[1]["lexical"]), float(item[1]["embedding"] or 0.0)),
+                    item[0],
+                ),
+            )[:max(1, int(top_n))]
+            by_mention[mention_index] = {**dict(ranked), **exact}
         return dict(by_mention)
 
 
@@ -207,8 +246,12 @@ class FeatureScorer:
             raise RuntimeError("Matcher artifact is stale for the prepared workbook. Run scripts/train.py again.")
         self.model = self.artifact.get("identity_model")
         self.target_model = self.artifact.get("target_model")
+        self.calibrator = self.artifact.get("calibrator")
         self.idf = self.artifact.get("idf", {})
         self.system_threshold = float(self.artifact.get("system_threshold", 0.90))
+        artifact_features = self.artifact.get("identity_features")
+        if artifact_features and list(artifact_features) != IDENTITY_FEATURES:
+            raise RuntimeError("Matcher feature schema changed. Run scripts/train.py again.")
 
     def score_proposals(self, proposals: list[MatchProposal], batch_size: int = 50_000) -> None:
         if not proposals:
@@ -219,7 +262,8 @@ class FeatureScorer:
             vectors = np.asarray([
                 pair_features(
                     proposal.mention_text, proposal.matched_name,
-                    proposal.lexical_score, proposal.embedding_score,
+                    proposal.char_tfidf_score, proposal.word_tfidf_score,
+                    proposal.rrf_score, proposal.embedding_score,
                     proposal.candidate_type, proposal.candidate_collision_count, self.idf,
                 ) for proposal in batch
             ], dtype=np.float32)
@@ -235,6 +279,15 @@ class FeatureScorer:
                     exact_floor = 0.999 if proposal.candidate_type == "official" else float(proposal.candidate_confidence or 0.0)
                     value = max(value, exact_floor)
                 proposal.feature_score = value
+            for proposal, vector in zip(batch, vectors):
+                proposal.char_similarity = float(vector[FEATURE_INDEX["char_ratio"]])
+                proposal.jaro_winkler = float(vector[FEATURE_INDEX["jaro_winkler"]])
+                proposal.levenshtein = float(vector[FEATURE_INDEX["levenshtein"]])
+                proposal.token_jaccard = float(vector[FEATURE_INDEX["token_jaccard"]])
+                proposal.raw_coverage = float(vector[FEATURE_INDEX["raw_coverage"]])
+                proposal.candidate_coverage = float(vector[FEATURE_INDEX["candidate_coverage"]])
+                proposal.digit_conflict = bool(vector[FEATURE_INDEX["digit_conflict"]])
+                proposal.distinctive_token_conflict = bool(vector[FEATURE_INDEX["distinctive_token_conflict"]])
 
     def target_score(
         self,
@@ -246,23 +299,29 @@ class FeatureScorer:
         identity = _combined_identity(proposal)
         vector = target_features(proposal, runner_up_identity, supporting_mentions, graph_depth)
         if self.target_model is not None:
-            return float(self.target_model.predict_proba(np.asarray([vector], dtype=np.float32))[0, 1])
-        margin = max(0.0, identity - runner_up_identity)
-        return float(max(0.0, min(0.999, identity * (0.92 + min(0.08, margin)))))
+            value = float(self.target_model.predict_proba(np.asarray([vector], dtype=np.float32))[0, 1])
+        else:
+            margin = max(0.0, identity - runner_up_identity)
+            value = float(max(0.0, min(0.999, identity * (0.92 + min(0.08, margin)))))
+        return float(self.calibrator.predict([value])[0]) if self.calibrator is not None else value
 
     def score_target_vectors(self, vectors: list[list[float]], batch_size: int = 50_000) -> np.ndarray:
         """Score shortlisted roots in large batches instead of one sklearn call per root."""
         if not vectors:
             return np.empty(0, dtype=np.float64)
-        matrix = np.asarray(vectors, dtype=np.float64)
+        matrix = np.asarray(vectors, dtype=np.float32)
         if self.target_model is None:
             margins = np.maximum(0.0, matrix[:, 0] - matrix[:, 3])
-            return np.clip(matrix[:, 0] * (0.92 + np.minimum(0.08, margins)), 0.0, 0.999)
-        size = max(1, int(batch_size))
-        return np.concatenate([
-            self.target_model.predict_proba(matrix[start:start + size])[:, 1]
-            for start in range(0, len(matrix), size)
-        ])
+            values = np.clip(matrix[:, 0] * (0.92 + np.minimum(0.08, margins)), 0.0, 0.999)
+        else:
+            size = max(1, int(batch_size))
+            values = np.concatenate([
+                self.target_model.predict_proba(matrix[start:start + size])[:, 1]
+                for start in range(0, len(matrix), size)
+            ])
+        if self.calibrator is not None:
+            values = np.asarray(self.calibrator.predict(values), dtype=np.float64)
+        return values
 
 
 class CrossEncoderReranker:
@@ -311,6 +370,9 @@ def collect_proposals(
         top_n=root_limit * variants_per_root,
     )
     raw_hits = sum(len(hits) for hits in indexed.values())
+    root_counts_before_cap: list[int] = []
+    root_cap_hits = 0
+    variant_cap_hits = 0
     for mention_index, hits in indexed.items():
         by_root = shortlists[mention_index]
         for query_index, evidence in hits.items():
@@ -318,25 +380,32 @@ def collect_proposals(
             root_id = graph.root_id(party_id)
             exact = float(evidence["exact"])
             lexical = float(evidence["lexical"])
+            char_score = float(evidence["char"])
+            word_score = float(evidence["word"])
+            rrf_score = float(evidence["rrf"])
             embedding = float(evidence["embedding"] or 0.0)
-            priority = 2.0 if exact else max(lexical, embedding)
+            priority = 2.0 if exact else max(lexical, embedding) + min(0.05, rrf_score)
             variants = by_root.setdefault(root_id, {})
             variant_key = (party_id, normalize_name(query_name))
             pending = (
                 priority, party_id, query_name, candidate_type, source,
                 candidate_confidence, sorted(evidence["sources"]), exact,
-                lexical, (embedding if evidence["embedding"] is not None else None),
+                lexical, char_score, word_score, rrf_score,
+                (embedding if evidence["embedding"] is not None else None),
             )
             current = variants.get(variant_key)
             if current is None or (priority, query_name) > (current[0], current[2]):
                 variants[variant_key] = pending
         for root_id, variants in tuple(by_root.items()):
             if len(variants) > variants_per_root:
+                variant_cap_hits += 1
                 retained = sorted(
                     variants.items(), key=lambda item: (-item[1][0], item[0]),
                 )[:variants_per_root]
                 by_root[root_id] = dict(retained)
+        root_counts_before_cap.append(len(by_root))
         if len(by_root) > root_limit:
+            root_cap_hits += 1
             ranked = sorted(
                 by_root.items(),
                 key=lambda item: (-max(value[0] for value in item[1].values()), item[0]),
@@ -351,7 +420,7 @@ def collect_proposals(
                 (
                     _, party_id, query_name, candidate_type, source,
                     candidate_confidence, retrieval_sources, exact,
-                    lexical, embedding,
+                    lexical, char_score, word_score, rrf_score, embedding,
                 ) = pending
                 owner = graph.nodes[party_id]
                 proposals.append(MatchProposal(
@@ -372,6 +441,9 @@ def collect_proposals(
                     retrieval_sources=retrieval_sources,
                     exact=exact,
                     lexical_score=lexical,
+                    char_tfidf_score=char_score,
+                    word_tfidf_score=word_score,
+                    rrf_score=rrf_score,
                     embedding_score=embedding,
                 ))
     scorer.score_proposals(
@@ -381,11 +453,18 @@ def collect_proposals(
     by_record: dict[str, list[MatchProposal]] = defaultdict(list)
     for proposal in proposals:
         by_record[proposal.adm_party_id].append(proposal)
+    count_values = np.asarray(root_counts_before_cap or [0], dtype=np.float32)
     return dict(by_record), {
         "verified_queries": len(queries),
         "raw_retrieval_hits": raw_hits,
         "scored_proposals": len(proposals),
         "retrieved_proposals": len(proposals),
+        "mentions_with_candidates": len(indexed),
+        "root_cap_hits": root_cap_hits,
+        "variant_cap_hits": variant_cap_hits,
+        "candidate_roots_p50": float(np.percentile(count_values, 50)),
+        "candidate_roots_p95": float(np.percentile(count_values, 95)),
+        "candidate_roots_max": int(count_values.max()),
         "retrieval_seconds": time.perf_counter() - started,
         "embedding_warning": retriever.embedding_warning,
     }
@@ -437,7 +516,7 @@ def decide_records(
         contexts.append({
             "record": record,
             "parse_warning": parse_warning,
-            "retrieved_roots": sorted(root_best),
+            "retrieved_roots": [proposal.root_party_id for proposal in identity_order],
             "scored_roots": [],
         })
         best_identity = _combined_identity(identity_order[0])
@@ -463,15 +542,34 @@ def decide_records(
         retrieved_roots = context["retrieved_roots"]
         scored_roots = context["scored_roots"]
         scored_roots.sort(key=lambda item: (-item[0], item[1].root_party_id))
-        confidence, winner = scored_roots[0]
-        runner_score, runner = scored_roots[1] if len(scored_roots) > 1 else (0.0, None)
+        eligible_roots = [
+            item for item in scored_roots
+            if not _guard_reason(item[1], matching_cfg)
+        ]
+        if eligible_roots:
+            confidence, winner = eligible_roots[0]
+            runner_score, runner = eligible_roots[1] if len(eligible_roots) > 1 else (0.0, None)
+        else:
+            confidence, winner = scored_roots[0]
+            runner_score, runner = scored_roots[1] if len(scored_roots) > 1 else (0.0, None)
         margin = confidence - runner_score
+        decision_tier = _decision_tier(winner, matching_cfg)
+        if not eligible_roots:
+            completed[record.adm_party_id] = _no_match(
+                record, _guard_reason(winner, matching_cfg) or "INSUFFICIENT_SUPPORT",
+                confidence=confidence, proposal=winner,
+                runner=runner, runner_score=runner_score, margin=margin,
+                retrieved_roots=retrieved_roots, parse_warning=parse_warning,
+                decision_tier=decision_tier,
+            )
+            continue
         if runner and margin < minimum_margin:
             reason = "CANDIDATE_COLLISION" if winner.candidate_collision_count > 1 else "AMBIGUOUS_FINAL_TARGETS"
             completed[record.adm_party_id] = _no_match(
                 record, reason, confidence=confidence, proposal=winner,
                 runner=runner, runner_score=runner_score, margin=margin,
                 retrieved_roots=retrieved_roots, parse_warning=parse_warning,
+                decision_tier=decision_tier,
             )
             continue
         if confidence < scorer.system_threshold:
@@ -479,6 +577,7 @@ def decide_records(
                 record, "INSUFFICIENT_SUPPORT", confidence=confidence, proposal=winner,
                 runner=runner, runner_score=runner_score, margin=margin,
                 retrieved_roots=retrieved_roots, parse_warning=parse_warning,
+                decision_tier=decision_tier,
             )
             continue
         path = graph.path_to_root(winner.owner_party_id)
@@ -499,8 +598,20 @@ def decide_records(
             matched_mention=winner.mention_text,
             connector=winner.connector_before or winner.connector_after,
             match_method=_match_method(winner),
+            decision_tier=decision_tier,
             retrieval_sources=winner.retrieval_sources,
             identity_score=winner.feature_score,
+            char_tfidf_score=winner.char_tfidf_score,
+            word_tfidf_score=winner.word_tfidf_score,
+            rrf_score=winner.rrf_score,
+            char_similarity=winner.char_similarity,
+            jaro_winkler=winner.jaro_winkler,
+            levenshtein=winner.levenshtein,
+            token_jaccard=winner.token_jaccard,
+            raw_coverage=winner.raw_coverage,
+            candidate_coverage=winner.candidate_coverage,
+            distinctive_token_conflict=winner.distinctive_token_conflict,
+            digit_conflict=winner.digit_conflict,
             cross_encoder_score=winner.cross_encoder_score,
             runner_up_party_id=runner.root_party_id if runner else None,
             runner_up_score=runner_score if runner else None,
@@ -661,6 +772,7 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
         "eligible_records": sum(record.eligible for record in records),
         "matchable_records": len(matchable),
         "verified_nodes": len(graph.nodes),
+        "graph_path": str(graph.path.resolve()),
         "graph_updates": len(graph_updates),
         "events": len(events),
         "effective_cutoff": effective_cutoff,
@@ -668,7 +780,7 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
         "strategy": effective_strategy,
         "requested_strategy": strategy,
         "cross_encoder_mode": rerank_mode,
-        "model_version": str(scorer.artifact.get("model_version", "fallback-rules-v1")),
+        "model_version": str(scorer.artifact.get("model_version", "fallback-rules-v2")),
         "model_warning": scorer.load_warning,
         "expansion_version": str(config.get("expansion", {}).get("version", "v1")),
         "graph_schema_version": graph.schema_version,
@@ -708,15 +820,17 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
         artifact = {
             "identity_model": None,
             "target_model": None,
+            "calibrator": None,
             "idf": _token_idf(party_names),
             "system_threshold": threshold,
             "identity_features": IDENTITY_FEATURES,
             "target_features": TARGET_FEATURES,
             "training_pairs": 0,
             "calibration_records": 0,
+            "calibration_method": "none",
             "precision_target": float(config.get("decision", {}).get("precision_target", 0.98)),
             "fallback_reason": SKLEARN_ERROR,
-            "model_version": "fallback-rules-v1",
+            "model_version": "fallback-rules-v2",
             "data_version": data_version,
             "cross_encoder_enabled": False,
         }
@@ -726,6 +840,7 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
             "positive_pairs": 0,
             "negative_pairs": 0,
             "calibration_records": 0,
+            "calibration_method": "none",
             "system_threshold": threshold,
             "cross_encoder": f"skipped: scikit-learn unavailable ({SKLEARN_ERROR})",
         }
@@ -734,6 +849,19 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
     canonical_vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1, dtype=np.float32)
     canonical_matrix = canonical_vectorizer.fit_transform(party_names)
     canonical_index = NearestNeighbors(metric="cosine", algorithm="brute").fit(canonical_matrix)
+    retrieval_cfg = config.get("retrieval", {})
+    mention_texts = [
+        mention.text for record in records.values() if record.eligible
+        for mention in parse_mentions(record) if mention.normalized
+    ]
+    char_vectorizer = (
+        TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1, sublinear_tf=True, dtype=np.float32).fit(mention_texts)
+        if mention_texts and bool(retrieval_cfg.get("char_tfidf_enabled", True)) else None
+    )
+    word_vectorizer = (
+        TfidfVectorizer(analyzer="word", ngram_range=(1, 2), min_df=1, sublinear_tf=True, dtype=np.float32).fit(mention_texts)
+        if mention_texts and bool(retrieval_cfg.get("word_tfidf_enabled", True)) else None
+    )
     idf = _token_idf(party_names)
     training_rows = [label for label in labels if label.get("split") == "TRAIN" and label.get("scorable")]
     pair_rows = _build_pair_rows(
@@ -743,7 +871,10 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
     )
     if len(pair_rows) < 20 or len({row[2] for row in pair_rows}) < 2:
         pair_rows = _synthetic_pair_rows(party_names)
-    x_train = np.asarray([pair_features(a, b, char_similarity(a, b), None, "official", 1, idf) for a, b, _ in pair_rows], dtype=np.float32)
+    x_train = _training_pair_matrix(
+        [(left, right) for left, right, _ in pair_rows], idf,
+        char_vectorizer, word_vectorizer, retrieval_cfg,
+    )
     y_train = np.asarray([label for _, _, label in pair_rows], dtype=np.int8)
     identity_model = HistGradientBoostingClassifier(
         learning_rate=0.08, max_iter=160, max_leaf_nodes=15,
@@ -751,17 +882,27 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
     ).fit(x_train, y_train)
 
     calibration_rows = [label for label in labels if label.get("split") == "CALIBRATION" and label.get("scorable")]
-    target_rows = [row for row in calibration_rows if sum(map(ord, row["adm_party_id"])) % 2 == 0]
-    threshold_rows = [row for row in calibration_rows if sum(map(ord, row["adm_party_id"])) % 2 == 1]
-    if len(target_rows) < 5 or len(threshold_rows) < 5:
-        target_rows, threshold_rows = [], calibration_rows
+    partitions = [[], [], []]
+    for row in calibration_rows:
+        bucket = int(row["adm_party_id"].replace("-", "")[:8], 16) % 3
+        partitions[bucket].append(row)
+    target_rows, isotonic_rows, threshold_rows = partitions
+    if min(map(len, partitions)) < 5:
+        target_rows, isotonic_rows, threshold_rows = [], [], calibration_rows
     target_examples, _ = _build_target_examples(
         target_rows, records, party_names, party_ids,
         canonical_vectorizer, canonical_index, identity_model, idf,
+        char_vectorizer, word_vectorizer, retrieval_cfg,
     )
-    _, decision_examples = _build_target_examples(
+    _, isotonic_decisions = _build_target_examples(
+        isotonic_rows, records, party_names, party_ids,
+        canonical_vectorizer, canonical_index, identity_model, idf,
+        char_vectorizer, word_vectorizer, retrieval_cfg,
+    )
+    _, threshold_decisions = _build_target_examples(
         threshold_rows, records, party_names, party_ids,
         canonical_vectorizer, canonical_index, identity_model, idf,
+        char_vectorizer, word_vectorizer, retrieval_cfg,
     )
     target_model = None
     if target_examples and len({label for _, label in target_examples}) > 1:
@@ -770,7 +911,28 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
             np.asarray([features for features, _ in target_examples], dtype=np.float32),
             np.asarray([label for _, label in target_examples], dtype=np.int8),
         )
-        decision_examples = _rescore_decision_examples(decision_examples, target_model)
+    isotonic_examples = _rescore_decision_examples(isotonic_decisions, target_model)
+    decision_examples = _rescore_decision_examples(threshold_decisions, target_model)
+    calibrator = None
+    calibration_method = "none"
+    requested_calibration = str(config.get("decision", {}).get("calibration_method", "isotonic"))
+    if (
+        requested_calibration == "isotonic"
+        and IsotonicRegression is not None
+        and len(isotonic_examples) >= 20
+        and len({bool(correct) for _, correct in isotonic_examples}) > 1
+        and len({round(float(score), 6) for score, _ in isotonic_examples}) >= 3
+    ):
+        calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+        raw_scores = np.asarray([score for score, _ in isotonic_examples], dtype=np.float64)
+        outcomes = np.asarray([correct for _, correct in isotonic_examples], dtype=np.int8)
+        calibrator.fit(raw_scores, outcomes)
+        calibrated_scores = calibrator.predict([score for score, _ in decision_examples])
+        decision_examples = [
+            (float(score), bool(correct))
+            for score, (_, correct) in zip(calibrated_scores, decision_examples)
+        ]
+        calibration_method = "isotonic"
     precision_target = float(config.get("decision", {}).get("precision_target", 0.98))
     fallback = float(config.get("decision", {}).get("fallback_system_threshold", 0.90))
     requested_minimum = int(config.get("decision", {}).get("minimum_calibration_matches", 100))
@@ -783,6 +945,7 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
     artifact = {
         "identity_model": identity_model,
         "target_model": target_model,
+        "calibrator": calibrator,
         "idf": idf,
         "system_threshold": threshold,
         "identity_features": IDENTITY_FEATURES,
@@ -790,7 +953,7 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
         "training_pairs": len(pair_rows),
         "calibration_records": len(calibration_rows),
         "precision_target": precision_target,
-        "model_version": f"feature-v1-{data_version}-{len(pair_rows)}-{seed}",
+        "model_version": f"feature-v3-{data_version}-{len(pair_rows)}-{seed}",
         "data_version": data_version,
         "cross_encoder_enabled": cross_encoder_status == "trained",
     }
@@ -800,6 +963,10 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
         "positive_pairs": int(y_train.sum()),
         "negative_pairs": int(len(y_train) - y_train.sum()),
         "calibration_records": len(calibration_rows),
+        "target_training_records": len(target_rows),
+        "isotonic_records": len(isotonic_rows),
+        "threshold_records": len(threshold_rows),
+        "calibration_method": calibration_method,
         "system_threshold": threshold,
         "cross_encoder": cross_encoder_status,
     }
@@ -810,7 +977,9 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
 def pair_features(
     left: str,
     right: str,
-    lexical_score: float,
+    char_tfidf_score: float,
+    word_tfidf_score: float,
+    rrf_score: float,
     embedding_score: float | None,
     candidate_type: str,
     collision_count: int,
@@ -822,6 +991,7 @@ def pair_features(
     weights = idf or {}
     shared_weight = sum(weights.get(token, 1.0) for token in intersection)
     total_weight = sum(weights.get(token, 1.0) for token in union) or 1.0
+    candidate_weight = sum(weights.get(token, 1.0) for token in right_tokens) or 1.0
     digits_left = {token for token in left_tokens if any(char.isdigit() for char in token)}
     digits_right = {token for token in right_tokens if any(char.isdigit() for char in token)}
     return [
@@ -829,17 +999,70 @@ def pair_features(
         float(bool(base_name(left)) and base_name(left) == base_name(right)),
         float(bool(compact_name(left)) and compact_name(left) == compact_name(right)),
         char_similarity(left_norm, right_norm),
+        jaro_winkler_similarity(left_norm, right_norm),
+        levenshtein_similarity(left_norm, right_norm),
         len(intersection) / max(1, len(union)),
+        len(intersection) / max(1, len(left_tokens)),
+        len(intersection) / max(1, len(right_tokens)),
         shared_weight / total_weight,
-        len(intersection) / max(1, min(len(left_tokens), len(right_tokens))),
+        shared_weight / candidate_weight,
         float(bool(digits_left and digits_right and digits_left != digits_right)),
+        float(distinctive_token_conflict(left_tokens, right_tokens, weights)),
         min(len(left_norm), len(right_norm)) / max(1, max(len(left_norm), len(right_norm))),
-        float(lexical_score),
+        float(char_tfidf_score),
+        float(word_tfidf_score),
+        min(1.0, float(rrf_score) * 30.0),
         float(embedding_score or 0.0),
         float(candidate_type == "official"),
         float(candidate_type == "abbreviation"),
         1.0 / max(1, collision_count),
+        float(acronym_relation(left_norm, right_norm)),
+        float(bool(left_norm != right_norm and base_name(left) and base_name(left) == base_name(right))),
     ]
+
+
+def _training_pair_matrix(
+    pairs: list[tuple[str, str]],
+    idf: dict[str, float],
+    char_vectorizer: TfidfVectorizer | None,
+    word_vectorizer: TfidfVectorizer | None,
+    retrieval_config: dict[str, Any],
+) -> np.ndarray:
+    """Use the same sparse score definitions as inference, in bounded batches."""
+    batches = []
+    for start in range(0, len(pairs), 10_000):
+        batch = pairs[start:start + 10_000]
+        lefts, rights = zip(*batch)
+
+        def cosine(vectorizer: TfidfVectorizer | None) -> np.ndarray:
+            if vectorizer is None:
+                return np.zeros(len(batch), dtype=np.float32)
+            left_matrix = vectorizer.transform(lefts)
+            right_matrix = vectorizer.transform(rights)
+            return np.asarray(left_matrix.multiply(right_matrix).sum(axis=1)).ravel()
+
+        char_scores = cosine(char_vectorizer)
+        word_scores = cosine(word_vectorizer)
+        char_min = float(retrieval_config.get("char_min_score", retrieval_config.get("lexical_min_score", 0.28)))
+        word_min = float(retrieval_config.get("word_min_score", 0.18))
+        rrf_k = float(retrieval_config.get("rrf_k", 60))
+        vectors = []
+        for (left, right), char_score, word_score in zip(batch, char_scores, word_scores):
+            if normalize_name(left) and normalize_name(left) == normalize_name(right):
+                char_score = 1.0 if char_vectorizer is not None else 0.0
+                word_score = 1.0 if word_vectorizer is not None else 0.0
+            rrf_score = 0.0
+            if bool(retrieval_config.get("rrf_enabled", True)):
+                rrf_score = (
+                    (1.0 / (rrf_k + 1.0) if char_vectorizer is not None and char_score >= char_min else 0.0)
+                    + (1.0 / (rrf_k + 1.0) if word_vectorizer is not None and word_score >= word_min else 0.0)
+                )
+            vectors.append(pair_features(
+                left, right, float(char_score), float(word_score), rrf_score,
+                None, "official", 1, idf,
+            ))
+        batches.append(np.asarray(vectors, dtype=np.float32))
+    return np.concatenate(batches) if batches else np.empty((0, len(IDENTITY_FEATURES)), dtype=np.float32)
 
 
 def target_features(
@@ -864,14 +1087,28 @@ def target_features(
 
 def rule_identity_score(vector: Iterable[float]) -> float:
     values = list(vector)
-    if values[0]:
+    if values[FEATURE_INDEX["exact"]]:
         return 0.999
-    if values[1]:
+    if values[FEATURE_INDEX["base_exact"]]:
         return 0.985
-    if values[2]:
+    if values[FEATURE_INDEX["compact_exact"]]:
         return 0.975
-    score = 0.38 * values[3] + 0.24 * values[5] + 0.14 * values[6] + 0.12 * values[9] + 0.10 * values[10]
-    score += 0.02 * values[11] - 0.35 * values[7]
+    score = (
+        0.14 * values[FEATURE_INDEX["char_ratio"]]
+        + 0.08 * values[FEATURE_INDEX["jaro_winkler"]]
+        + 0.07 * values[FEATURE_INDEX["levenshtein"]]
+        + 0.08 * values[FEATURE_INDEX["token_jaccard"]]
+        + 0.12 * values[FEATURE_INDEX["candidate_coverage"]]
+        + 0.08 * values[FEATURE_INDEX["weighted_token_overlap"]]
+        + 0.12 * values[FEATURE_INDEX["char_tfidf"]]
+        + 0.13 * values[FEATURE_INDEX["word_tfidf"]]
+        + 0.06 * values[FEATURE_INDEX["rrf_score"]]
+        + 0.07 * values[FEATURE_INDEX["embedding_score"]]
+        + 0.03 * values[FEATURE_INDEX["official"]]
+        + 0.02 * values[FEATURE_INDEX["acronym_relation"]]
+        - 0.45 * values[FEATURE_INDEX["digit_conflict"]]
+        - 0.30 * values[FEATURE_INDEX["distinctive_token_conflict"]]
+    )
     return max(0.001, min(0.97, score))
 
 
@@ -881,6 +1118,49 @@ def char_similarity(left: str, right: str) -> float:
         return float(ratio(left, right)) / 100.0
     except ImportError:
         return SequenceMatcher(None, left, right).ratio()
+
+
+def jaro_winkler_similarity(left: str, right: str) -> float:
+    try:
+        from rapidfuzz.distance import JaroWinkler
+        return float(JaroWinkler.normalized_similarity(left, right))
+    except ImportError:
+        return char_similarity(left, right)
+
+
+def levenshtein_similarity(left: str, right: str) -> float:
+    try:
+        from rapidfuzz.distance import Levenshtein
+        return float(Levenshtein.normalized_similarity(left, right))
+    except ImportError:
+        return char_similarity(left, right)
+
+
+def acronym_relation(left: str, right: str) -> bool:
+    def meaningful(value: str) -> list[str]:
+        return [token for token in value.split() if token not in LEGAL_SUFFIXES]
+    left_tokens, right_tokens = meaningful(left), meaningful(right)
+    left_compact, right_compact = "".join(left_tokens), "".join(right_tokens)
+    left_initials = "".join(token[0] for token in left_tokens) if len(left_tokens) > 1 else ""
+    right_initials = "".join(token[0] for token in right_tokens) if len(right_tokens) > 1 else ""
+    return bool(
+        (len(left_tokens) == 1 and left_compact == right_initials)
+        or (len(right_tokens) == 1 and right_compact == left_initials)
+    )
+
+
+def distinctive_token_conflict(
+    left_tokens: set[str], right_tokens: set[str], weights: dict[str, float],
+) -> bool:
+    exempt = set(LEGAL_SUFFIXES) | {"a", "an", "the", "of", "and"}
+    left_only = left_tokens - right_tokens - exempt
+    right_only = right_tokens - left_tokens - exempt
+    shared = (left_tokens & right_tokens) - exempt
+    if not shared or not left_only or not right_only:
+        return False
+    left_distinctive = {token for token in left_only if len(token) <= 4 or weights.get(token, 1.0) >= 1.5}
+    right_distinctive = {token for token in right_only if len(token) <= 4 or weights.get(token, 1.0) >= 1.5}
+    return bool(left_distinctive and right_distinctive)
 
 
 def _combined_identity(proposal: MatchProposal) -> float:
@@ -904,11 +1184,37 @@ def _match_method(proposal: MatchProposal) -> str:
     if proposal.cross_encoder_score is not None:
         return "selective_hybrid:cross_encoder"
     sources = set(proposal.retrieval_sources)
-    if "embedding" in sources and "lexical" in sources:
-        return "feature:lexical_embedding"
+    lexical = sorted(sources & {"word", "char"})
+    if "embedding" in sources and lexical:
+        return "feature:" + "_".join([*lexical, "embedding"])
     if "embedding" in sources:
         return "feature:embedding"
-    return "feature:lexical"
+    return "feature:" + ("_".join(lexical) if lexical else "retrieved")
+
+
+def _decision_tier(proposal: MatchProposal, config: dict[str, Any]) -> str:
+    if proposal.exact and proposal.candidate_type == "official":
+        return "EXACT_OFFICIAL"
+    if proposal.exact:
+        return "EXACT_CANDIDATE"
+    if (
+        proposal.candidate_coverage >= float(config.get("directional_coverage_threshold", 0.90))
+        and proposal.token_jaccard >= float(config.get("directional_jaccard_threshold", 0.45))
+    ):
+        return "DIRECTIONAL_CONTAINMENT"
+    if proposal.cross_encoder_score is not None:
+        return "CROSS_ENCODER"
+    return "MULTI_SIGNAL"
+
+
+def _guard_reason(proposal: MatchProposal, config: dict[str, Any]) -> str | None:
+    if proposal.exact:
+        return None
+    if bool(config.get("digit_conflict_guard", True)) and proposal.digit_conflict:
+        return "DIGIT_CONFLICT"
+    if bool(config.get("distinctive_token_guard", True)) and proposal.distinctive_token_conflict:
+        return "DISTINCTIVE_TOKEN_CONFLICT"
+    return None
 
 
 def _no_match(
@@ -921,6 +1227,7 @@ def _no_match(
     margin: float | None = None,
     retrieved_roots: list[str] | None = None,
     parse_warning: str | None = None,
+    decision_tier: str | None = None,
 ) -> FinalDecision:
     return FinalDecision(
         account_id=record.account_id, adm_party_id=record.adm_party_id,
@@ -934,8 +1241,21 @@ def _no_match(
         candidate_expansion_confidence=proposal.candidate_confidence if proposal else None,
         matched_mention=proposal.mention_text if proposal else None,
         connector=(proposal.connector_before or proposal.connector_after) if proposal else None,
+        match_method=_match_method(proposal) if proposal else None,
+        decision_tier=decision_tier,
         retrieval_sources=proposal.retrieval_sources if proposal else [],
         identity_score=proposal.feature_score if proposal else None,
+        char_tfidf_score=proposal.char_tfidf_score if proposal else None,
+        word_tfidf_score=proposal.word_tfidf_score if proposal else None,
+        rrf_score=proposal.rrf_score if proposal else None,
+        char_similarity=proposal.char_similarity if proposal else None,
+        jaro_winkler=proposal.jaro_winkler if proposal else None,
+        levenshtein=proposal.levenshtein if proposal else None,
+        token_jaccard=proposal.token_jaccard if proposal else None,
+        raw_coverage=proposal.raw_coverage if proposal else None,
+        candidate_coverage=proposal.candidate_coverage if proposal else None,
+        distinctive_token_conflict=proposal.distinctive_token_conflict if proposal else None,
+        digit_conflict=proposal.digit_conflict if proposal else None,
         cross_encoder_score=proposal.cross_encoder_score if proposal else None,
         runner_up_party_id=runner.root_party_id if runner else None,
         runner_up_score=runner_score,
@@ -969,14 +1289,6 @@ def _build_pair_rows(
         record = records.get(label["adm_party_id"])
         expected = party_name_by_id.get(label.get("expected_party_id"))
         if not record or not expected or len(parse_mentions(record)) != 1:
-            continue
-        similarity = char_similarity(record.raw_name, expected)
-        reliable_identity = (
-            normalize_name(record.raw_name) == normalize_name(expected)
-            or base_name(record.raw_name) == base_name(expected)
-            or similarity >= 0.82
-        )
-        if not reliable_identity:
             continue
         usable.append((record.raw_name, expected, label.get("expected_party_id")))
     if not usable:
@@ -1023,25 +1335,39 @@ def _build_target_examples(
     index: NearestNeighbors,
     identity_model: Any,
     idf: dict[str, float],
+    char_vectorizer: TfidfVectorizer | None,
+    word_vectorizer: TfidfVectorizer | None,
+    retrieval_config: dict[str, Any],
 ) -> tuple[list[tuple[list[float], int]], list[dict[str, Any]]]:
     expected_by_id = dict(zip(party_ids, party_names))
     usable = [(row, records.get(row["adm_party_id"])) for row in label_rows]
-    usable = [(row, record) for row, record in usable if record and row.get("expected_party_id") in expected_by_id]
+    usable = [
+        (row, record) for row, record in usable
+        if record and row.get("expected_party_id") in expected_by_id and len(parse_mentions(record)) == 1
+    ]
     if not usable:
         return [], []
     count = min(10, len(party_names))
     _, indices = index.kneighbors(vectorizer.transform([record.raw_name for _, record in usable]), n_neighbors=count)
-    examples, decisions = [], []
+    candidate_groups = []
+    pairs = []
     for (label, record), candidate_indices in zip(usable, indices):
         candidate_ids = [party_ids[int(index_value)] for index_value in candidate_indices]
         if label["expected_party_id"] not in candidate_ids:
             candidate_ids.append(label["expected_party_id"])
-        candidates = []
-        for candidate_id in candidate_ids:
-            name = expected_by_id[candidate_id]
-            vector = pair_features(record.raw_name, name, char_similarity(record.raw_name, name), None, "official", 1, idf)
-            identity = float(identity_model.predict_proba(np.asarray([vector], dtype=np.float32))[0, 1])
-            candidates.append((candidate_id, name, identity, vector[0]))
+        candidate_groups.append((label, candidate_ids))
+        pairs.extend((record.raw_name, expected_by_id[candidate_id]) for candidate_id in candidate_ids)
+    vectors = _training_pair_matrix(pairs, idf, char_vectorizer, word_vectorizer, retrieval_config)
+    identity_scores = identity_model.predict_proba(vectors)[:, 1]
+    examples, decisions = [], []
+    offset = 0
+    for label, candidate_ids in candidate_groups:
+        candidates = [
+            (candidate_id, expected_by_id[candidate_id], float(identity_scores[offset + index_value]),
+             float(vectors[offset + index_value, 0]))
+            for index_value, candidate_id in enumerate(candidate_ids)
+        ]
+        offset += len(candidate_ids)
         candidates.sort(key=lambda item: (-item[2], item[0]))
         for candidate_id, name, identity, exact in candidates:
             runner = max((item[2] for item in candidates if item[0] != candidate_id), default=0.0)
@@ -1054,7 +1380,7 @@ def _build_target_examples(
     return examples, decisions
 
 
-def _rescore_decision_examples(decisions: list[dict[str, Any]], model: Any) -> list[tuple[float, bool]]:
+def _rescore_decision_examples(decisions: list[dict[str, Any]], model: Any | None) -> list[tuple[float, bool]]:
     output = []
     for decision in decisions:
         candidates = decision["candidates"]
@@ -1062,7 +1388,11 @@ def _rescore_decision_examples(decisions: list[dict[str, Any]], model: Any) -> l
         for candidate_id, _, identity, exact in candidates:
             runner = max((item[2] for item in candidates if item[0] != candidate_id), default=0.0)
             vector = [identity, identity, 0.0, runner, identity - runner, exact, 1.0, 1.0, 1.0]
-            scored.append((float(model.predict_proba(np.asarray([vector], dtype=np.float32))[0, 1]), candidate_id))
+            if model is None:
+                score = identity * (0.92 + min(0.08, max(0.0, identity - runner)))
+            else:
+                score = float(model.predict_proba(np.asarray([vector], dtype=np.float32))[0, 1])
+            scored.append((float(score), candidate_id))
         scored.sort(key=lambda item: (-item[0], item[1]))
         output.append((scored[0][0], scored[0][1] == decision["expected_id"]))
     return output

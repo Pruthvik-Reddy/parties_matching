@@ -30,6 +30,12 @@ minimum_parent_confidence = 0.85
 max_roots_per_mention = 50
 max_variants_per_root = 2
 identity_batch_size = 50000
+word_tfidf_enabled = true
+char_tfidf_enabled = true
+rrf_enabled = true
+rrf_k = 60
+word_min_score = 0.18
+char_min_score = 0.28
 embedding_top_k = 100
 lexical_min_score = 0.28
 embedding_min_score = 0.42
@@ -48,12 +54,17 @@ ambiguous_margin = 0.08
 rerank_top_k = 5
 minimum_root_margin = 0.04
 confidence_batch_size = 50000
+distinctive_token_guard = true
+digit_conflict_guard = true
+directional_coverage_threshold = 0.90
+directional_jaccard_threshold = 0.45
 
 [decision]
 precision_target = 0.98
 request_confidence_cutoff = 0.0
 fallback_system_threshold = 0.90
 minimum_calibration_matches = 100
+calibration_method = "isotonic" # isotonic | none
 
 [execution]
 mode = "parallel" # serial | parallel

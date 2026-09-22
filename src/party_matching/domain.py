@@ -175,10 +175,21 @@ class MatchProposal:
     retrieval_sources: list[str] = field(default_factory=list)
     exact: float = 0.0
     lexical_score: float = 0.0
+    char_tfidf_score: float = 0.0
+    word_tfidf_score: float = 0.0
+    rrf_score: float = 0.0
     embedding_score: float | None = None
     feature_score: float = 0.0
     cross_encoder_score: float | None = None
     candidate_collision_count: int = 1
+    char_similarity: float = 0.0
+    jaro_winkler: float = 0.0
+    levenshtein: float = 0.0
+    token_jaccard: float = 0.0
+    raw_coverage: float = 0.0
+    candidate_coverage: float = 0.0
+    distinctive_token_conflict: bool = False
+    digit_conflict: bool = False
 
 
 @dataclass
@@ -199,8 +210,20 @@ class FinalDecision:
     matched_mention: str | None = None
     connector: str | None = None
     match_method: str | None = None
+    decision_tier: str | None = None
     retrieval_sources: list[str] = field(default_factory=list)
     identity_score: float | None = None
+    char_tfidf_score: float | None = None
+    word_tfidf_score: float | None = None
+    rrf_score: float | None = None
+    char_similarity: float | None = None
+    jaro_winkler: float | None = None
+    levenshtein: float | None = None
+    token_jaccard: float | None = None
+    raw_coverage: float | None = None
+    candidate_coverage: float | None = None
+    distinctive_token_conflict: bool | None = None
+    digit_conflict: bool | None = None
     cross_encoder_score: float | None = None
     runner_up_party_id: str | None = None
     runner_up_score: float | None = None
