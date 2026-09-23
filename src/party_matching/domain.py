@@ -190,6 +190,7 @@ class MatchProposal:
     candidate_coverage: float = 0.0
     distinctive_token_conflict: bool = False
     digit_conflict: bool = False
+    unique_short_confidence: float | None = None
 
 
 @dataclass

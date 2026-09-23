@@ -178,6 +178,9 @@ class VerifiedGraph:
     def candidate_collision_count(self, candidate_name: str) -> int:
         return len(self._candidate_owners.get(normalize_name(candidate_name), set())) or 1
 
+    def candidate_owner_ids(self, candidate_name: str) -> set[str]:
+        return self._candidate_owners.get(normalize_name(candidate_name), set())
+
     def _would_cycle(self, child_id: str, parent_id: str) -> bool:
         current = parent_id
         while current:

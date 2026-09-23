@@ -13,7 +13,7 @@ python --version
 python -m pip install .
 ```
 
-`python -m pip install .` deliberately avoids editable-install limitations in older pip versions such as 21.2.4. If you later replace any source files, run that command again. Do not copy `.venv`, `*.egg-info`, `artifacts`, `data/prepared`, `outputs`, or `state` between computers.
+`python -m pip install .` deliberately avoids editable-install limitations in older pip versions such as 21.2.4. If you later replace source files, reinstall or run scripts with `PYTHONPATH=src` to use the new code. Do not copy `.venv`, `*.egg-info`, `artifacts`, `data/prepared`, `outputs`, or `state` between computers.
 
 Optional integrations:
 
@@ -45,12 +45,10 @@ python scripts/train.py
 python scripts/run.py --mode parallel --fresh-state
 ```
 
-After copying this source update onto a laptop that already has the same prepared workbook, rerun installation and training, then make a fresh evaluation run. Training now calculates word/character TF-IDF features using the same definitions as matching. `prepare.py` is only needed again if the workbook or preparation settings changed.
+For this decision-rule and report update, the existing trained artifact can be reused; the feature schema has not changed. After copying the changed source files, run from the repo root with `PYTHONPATH=src` so Python uses those files without reinstalling. `prepare.py` is only needed again if the workbook or preparation settings changed.
 
 ```bash
-python -m pip install .
-python scripts/train.py
-python scripts/run.py --mode parallel --fresh-state --output outputs/exp4
+PYTHONPATH=src python scripts/run.py --mode parallel --fresh-state --output outputs/exp4
 ```
 
 Use `--limit 1000` for a quick prefix sample or `--ids-file adm_ids.txt` for a targeted set of ADM IDs.
@@ -63,7 +61,7 @@ Each run writes:
 
 - `events.jsonl`: API-shaped accepted mapping events.
 - `decisions.jsonl`: every decision and its evidence.
-- `predictions.xlsx`: complete `Summary` and `Detail` sheets.
+- `predictions.xlsx`: `Summary` groups every accepted raw-name match under its predicted verified party; `Stats` has run metrics; `Detail` has every source row.
 - `run_metrics.json`: full held-out, split, case and confidence metrics.
 - `diagnostics.json`: compact retrieval funnel, connector cohorts and error buckets.
 - `run_stats.json` and `analysis.md`.
@@ -75,15 +73,15 @@ Evaluation should use `--fresh-state`. Incremental runs omit that flag and reuse
 - Only verified parties are graph nodes.
 - Expansion candidates retrieve ADM names for their owner. `suggested_parent` never does.
 - Low-confidence LLM candidates and parents are discarded using the configurable expansion thresholds.
-- OBO and VIA segments are matched independently with the normal per-name scoring, guards and cutoff. If one segment matches, it wins; if multiple resolve to the same root, the strongest wins. Distinct roots use the leftmost valid OBO segment or rightmost valid VIA segment. Mixed or malformed connectors abstain. Set `connector_policy = "legacy"` to compare with the earlier pooled behavior.
-- Conflicting-root choices are emitted only when a separate connector gate has enough calibration evidence to meet the precision target. Otherwise the run abstains and shows the provisional choice plus every segment result in the Detail sheet. Retrain after this update; an older artifact has no connector gate.
+- OBO and VIA segments are matched independently. A unique, long official-name prefix followed only by generic company descriptors (for example, `Carahsoft` for `Carahsoft Technology Corp.`) gets a narrow deterministic match rule. It does not lower the general cutoff; it is disabled when another verified root shares that prefix or owns the exact short name.
+- Distinct roots use the leftmost valid OBO segment or rightmost valid VIA segment. If that preferred segment is just below cutoff, the run abstains instead of automatically emitting the other segment. A uniquely identified short-name match on the preferred side can resolve a conflict directly; other conflicting-root choices still require the calibrated connector gate. Mixed or malformed connectors abstain. Set `connector_policy = "legacy"` to compare with the earlier pooled behavior.
 - Proposals are grouped by global root before distinct roots compete.
 - Retrieval is bounded by `max_roots_per_mention` and `max_variants_per_root`; cap-hit statistics are written to diagnostics.
 - Headline precision and recall use only untouched `TEST_KNOWN` and `TEST_UNSEEN` rows. Training and calibration results remain visible but are not mixed into the headline.
 - Evaluation resolves each workbook canonical label through the verified graph before comparing it with the emitted global parent.
 - OBO/VIA, no-OBO, no-VIA and plain-name cohorts are reported separately.
 - `UNKNOWN` rows appear in predictions but not supervised metrics.
-- Detail starts with raw name, original workbook label, accepted prediction (or `NO_MATCH`), expected global parent, correctness and decision. Summary shows unknown prediction count and connector-resolution cohorts. `run_stats.json` and `analysis.md` include stage timings and process-memory snapshots; `end_to_end_seconds` includes workbook generation.
+- Detail keeps one `Correct Answer` (the expected global parent), accepted prediction or `NO_MATCH`, a readable result and a small set of review clues. IDs and full scoring evidence remain in `decisions.jsonl`, not Excel. Stats shows unknown prediction count and connector cohorts. Summary lists all accepted matches by predicted verified party, including matches on unknown-label rows; large alias lists continue on additional rows. `run_stats.json` and `analysis.md` include stage timings and process-memory snapshots; `end_to_end_seconds` includes workbook generation.
 - Rows that already have a verified parent remain in predictions, but are excluded from matching, training, and supervised metrics.
 - The matcher never reads `labels.jsonl`; only reporting and training do.
 - A matcher artifact is rejected when it was trained against a different prepared workbook.

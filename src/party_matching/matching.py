@@ -61,6 +61,7 @@ TARGET_FEATURES = [
     "identity", "cross_encoder", "has_cross_encoder", "runner_up_identity",
     "identity_margin", "exact", "collision_penalty", "supporting_mentions", "graph_depth",
 ]
+SHORT_NAME_DESCRIPTORS = {"technology", "technologies", "systems", "services", "solutions", "software"}
 
 
 class MentionRetriever:
@@ -369,6 +370,7 @@ def collect_proposals(
     graph: VerifiedGraph,
     retriever: MentionRetriever,
     scorer: FeatureScorer,
+    matching_config: dict[str, Any] | None = None,
 ) -> tuple[dict[str, list[MatchProposal]], dict[str, Any]]:
     queries: list[tuple[str, str, str, str, float | None]] = []
     for party_id in sorted(graph.nodes):
@@ -471,6 +473,7 @@ def collect_proposals(
         proposals,
         batch_size=int(retriever.config.get("identity_batch_size", 50_000)),
     )
+    unique_short_proposals = _mark_unique_short_names(graph, proposals, matching_config or {})
     by_record: dict[str, list[MatchProposal]] = defaultdict(list)
     for proposal in proposals:
         by_record[proposal.adm_party_id].append(proposal)
@@ -479,6 +482,7 @@ def collect_proposals(
         "verified_queries": len(queries),
         "raw_retrieval_hits": raw_hits,
         "scored_proposals": len(proposals),
+        "unique_short_proposals": unique_short_proposals,
         "retrieved_proposals": len(proposals),
         "mentions_with_candidates": len(indexed),
         "root_cap_hits": root_cap_hits,
@@ -497,6 +501,47 @@ def collect_proposals(
         **scorer.timing,
         "embedding_warning": retriever.embedding_warning,
     }
+
+
+def _mark_unique_short_names(
+    graph: VerifiedGraph, proposals: list[MatchProposal], config: dict[str, Any],
+) -> int:
+    if not config.get("unique_short_names", True):
+        return 0
+    minimum = int(config.get("unique_short_min_chars", 7))
+    descriptors = set(config.get("unique_short_descriptors", SHORT_NAME_DESCRIPTORS))
+    eligible: dict[str, set[str]] = defaultdict(set)
+    for node in graph.nodes.values():
+        tokens = base_name(node.party_name).split()
+        if (
+            len(tokens) > 1 and len(tokens[0]) >= minimum
+            and tokens[0].isalpha() and set(tokens[1:]) <= descriptors
+        ):
+            eligible[tokens[0]].add(node.party_id)
+    if not eligible:
+        return 0
+    prefix_roots: dict[str, set[str]] = defaultdict(set)
+    for node in graph.nodes.values():
+        tokens = normalize_name(node.party_name).split()
+        if tokens and tokens[0] in eligible:
+            prefix_roots[tokens[0]].add(graph.root_id(node.party_id))
+    approved: dict[str, str] = {}
+    for prefix, owners in eligible.items():
+        roots = prefix_roots[prefix]
+        if len(roots) != 1:
+            continue
+        root = next(iter(roots))
+        if any(graph.root_id(owner) != root for owner in graph.candidate_owner_ids(prefix)):
+            continue
+        approved.update((owner, prefix) for owner in owners)
+    confidence = min(0.999, max(0.0, float(config.get("unique_short_confidence", 0.985))))
+    marked = 0
+    for proposal in proposals:
+        prefix = approved.get(proposal.owner_party_id) if proposal.candidate_type == "official" else None
+        if prefix and normalize_name(proposal.mention_text) == prefix:
+            proposal.unique_short_confidence = confidence
+            marked += 1
+    return marked
 
 
 def _decide_records_legacy(
@@ -563,7 +608,9 @@ def _decide_records_legacy(
         batch_size=int(matching_cfg.get("confidence_batch_size", 50_000)),
     )
     for score, (context_index, proposal) in zip(target_scores, target_destinations):
-        contexts[context_index]["scored_roots"].append((float(score), proposal))
+        contexts[context_index]["scored_roots"].append(
+            (max(float(score), proposal.unique_short_confidence or 0.0), proposal)
+        )
 
     for context in contexts:
         record = context["record"]
@@ -575,7 +622,14 @@ def _decide_records_legacy(
             item for item in scored_roots
             if not _guard_reason(item[1], matching_cfg)
         ]
-        if eligible_roots:
+        short_roots = [item for item in eligible_roots if item[1].unique_short_confidence is not None]
+        if short_roots:
+            confidence, winner = max(short_roots, key=lambda item: (item[0], item[1].root_party_id))
+            runner_score, runner = next(
+                ((score, proposal) for score, proposal in eligible_roots if proposal.root_party_id != winner.root_party_id),
+                (0.0, None),
+            )
+        elif eligible_roots:
             confidence, winner = eligible_roots[0]
             runner_score, runner = eligible_roots[1] if len(eligible_roots) > 1 else (0.0, None)
         else:
@@ -592,7 +646,7 @@ def _decide_records_legacy(
                 decision_tier=decision_tier,
             )
             continue
-        if runner and margin < minimum_margin:
+        if runner and margin < minimum_margin and winner.unique_short_confidence is None:
             reason = "CANDIDATE_COLLISION" if winner.candidate_collision_count > 1 else "AMBIGUOUS_FINAL_TARGETS"
             completed[record.adm_party_id] = _no_match(
                 record, reason, confidence=confidence, proposal=winner,
@@ -718,7 +772,9 @@ def _decide_connectors(
 
     scores = scorer.score_target_vectors(vectors, batch_size=int(matching_cfg.get("confidence_batch_size", 50_000)))
     for score, (record_index, mention_index, proposal) in zip(scores, destinations):
-        contexts[record_index]["mentions"][mention_index]["scored"].append((float(score), proposal))
+        contexts[record_index]["mentions"][mention_index]["scored"].append(
+            (max(float(score), proposal.unique_short_confidence or 0.0), proposal)
+        )
 
     decisions: list[FinalDecision] = []
     conflicts: list[tuple[str, str, str, list[float]]] = []
@@ -739,15 +795,19 @@ def _decide_connectors(
                 retrieved[proposal.root_party_id] = max(retrieved.get(proposal.root_party_id, 0.0), _combined_identity(proposal))
             scored = sorted(item["scored"], key=lambda value: (-value[0], value[1].root_party_id))
             eligible = [value for value in scored if not _guard_reason(value[1], matching_cfg)]
-            top = eligible[0] if eligible else (scored[0] if scored else None)
-            runner = eligible[1] if len(eligible) > 1 else None
+            short = [value for value in eligible if value[1].unique_short_confidence is not None]
+            top = max(short, key=lambda value: (value[0], value[1].root_party_id)) if short else (
+                eligible[0] if eligible else (scored[0] if scored else None)
+            )
+            runner = next((value for value in eligible if top and value[1].root_party_id != top[1].root_party_id), None)
+            item["top"] = top
             confidence, proposal = top if top else (0.0, None)
             margin = confidence - (runner[0] if runner else 0.0)
             if proposal is None:
                 reason = "NO_CANDIDATES"
             elif not eligible:
                 reason = _guard_reason(proposal, matching_cfg) or "INSUFFICIENT_SUPPORT"
-            elif runner and margin < minimum_margin:
+            elif runner and margin < minimum_margin and not short:
                 reason = "AMBIGUOUS_FINAL_TARGETS"
             elif confidence < scorer.system_threshold:
                 reason = "INSUFFICIENT_SUPPORT"
@@ -760,6 +820,7 @@ def _decide_connectors(
                 "root_name": proposal.root_party_name if proposal else None,
                 "matched_candidate": proposal.matched_name if proposal else None,
                 "exact": bool(proposal.exact) if proposal else False,
+                "unique_short_official": bool(proposal.unique_short_confidence) if proposal else False,
                 "runner_up_root_id": runner[1].root_party_id if runner else None,
                 "runner_up_score": runner[0] if runner else None,
                 "margin": margin if proposal else None,
@@ -773,6 +834,23 @@ def _decide_connectors(
                 best_rejected = (confidence, proposal)
         retrieved_roots = [root for root, _ in sorted(retrieved.items(), key=lambda item: (-item[1], item[0]))]
         connector = context["connector"]
+        preferred_index = 0 if connector == "OBO" else len(mention_results) - 1
+        preferred = mention_results[preferred_index]
+        band = max(0.0, float(matching_cfg.get("preferred_near_cutoff_band", 0.03)))
+        if (
+            valid and not any(item["position"] == preferred["position"] for item in valid)
+            and preferred["root_id"] and preferred["reason"] in {"INSUFFICIENT_SUPPORT", "AMBIGUOUS_FINAL_TARGETS"}
+            and preferred["confidence"] >= scorer.system_threshold - band
+        ):
+            proposal = context["mentions"][preferred_index]["top"][1]
+            decision = _no_match(
+                record, "PREFERRED_SEGMENT_NEAR_CUTOFF", preferred["confidence"],
+                proposal=proposal, retrieved_roots=retrieved_roots,
+            )
+            decision.connector_resolution = "PREFERRED_NEAR_CUTOFF"
+            decision.mention_results = mention_results
+            decisions.append(decision)
+            continue
         if not valid:
             reasons = {item["reason"] for item in mention_results}
             reason = "AMBIGUOUS_FINAL_TARGETS" if "AMBIGUOUS_FINAL_TARGETS" in reasons else (
@@ -783,6 +861,7 @@ def _decide_connectors(
             decision.connector_resolution = "NONE"
         else:
             roots = {item["proposal"].root_party_id for item in valid}
+            trusted = False
             if len(roots) == 1:
                 chosen = max(valid, key=lambda item: (item["confidence"], -item["position"]))
                 resolution = "ONLY_MATCH" if len(valid) == 1 else "SAME_ROOT"
@@ -792,8 +871,21 @@ def _decide_connectors(
                 resolution = f"{connector}_{'LEFT' if connector == 'OBO' else 'RIGHT'}"
                 features = _connector_features(chosen, [item for item in valid if item is not chosen])
                 conflicts.append((record.adm_party_id, connector, chosen["proposal"].root_party_id, features))
-                model_info = scorer.connector_models.get(connector) if apply_gate else None
-                confidence = float(model_info["model"].predict_proba(np.asarray([features], dtype=np.float32))[0, 1]) if model_info else 0.0
+                proposal = chosen["proposal"]
+                trusted = (
+                    chosen["position"] == preferred["position"]
+                    and proposal.unique_short_confidence is not None
+                )
+                model_info = scorer.connector_models.get(connector) if apply_gate and not trusted else None
+                if trusted:
+                    confidence = chosen["confidence"]
+                else:
+                    confidence = (
+                        float(model_info["model"].predict_proba(np.asarray([features], dtype=np.float32))[0, 1])
+                        if model_info else 0.0
+                    )
+                if trusted:
+                    resolution += "_STRONG_NAME"
             proposal = chosen["proposal"]
             runner = chosen["runner"]
             decision = _no_match(
@@ -805,9 +897,9 @@ def _decide_connectors(
             decision.provisional_party_name = proposal.root_party_name
             decision.selected_mention_position = chosen["position"]
             decision.connector_resolution = resolution
-            if len(roots) > 1 and apply_gate and not model_info:
+            if len(roots) > 1 and apply_gate and not trusted and not model_info:
                 decision.reason = "CONNECTOR_UNCALIBRATED"
-            elif len(roots) > 1 and apply_gate and confidence < float(model_info["threshold"]):
+            elif len(roots) > 1 and apply_gate and not trusted and confidence < float(model_info["threshold"]):
                 decision.reason = "CONNECTOR_BELOW_CUTOFF"
             else:
                 decision.decision = "MATCH"
@@ -903,7 +995,7 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
         artifact_dir / "cross_encoder",
         rerank_mode,
     )
-    proposals, retrieval_stats = collect_proposals(graph, retriever, scorer)
+    proposals, retrieval_stats = collect_proposals(graph, retriever, scorer, config.get("matching", {}))
     decision_started = time.perf_counter()
     decisions = decide_records(matchable, proposals, graph, scorer, reranker, config)
     decision_seconds = time.perf_counter() - decision_started
@@ -1228,7 +1320,7 @@ def _train_connector_models(
     graph.add_parties(parties)
     retriever = MentionRetriever(selected, config.get("retrieval", {}), workers=int(config.get("execution", {}).get("workers", 1)))
     scorer = FeatureScorer(artifact_path, data_version)
-    proposals, _ = collect_proposals(graph, retriever, scorer)
+    proposals, _ = collect_proposals(graph, retriever, scorer, config.get("matching", {}))
     rerank_mode = (str(config.get("matching", {}).get("cross_encoder_mode", "ambiguous"))
                    if scorer.artifact.get("cross_encoder_enabled", False) else "off")
     _, conflicts = _decide_connectors(selected, proposals, graph, scorer,
@@ -1460,9 +1552,9 @@ def distinctive_token_conflict(
 
 
 def _combined_identity(proposal: MatchProposal) -> float:
-    if proposal.cross_encoder_score is None:
-        return proposal.feature_score
-    return 0.55 * proposal.feature_score + 0.45 * proposal.cross_encoder_score
+    value = (proposal.feature_score if proposal.cross_encoder_score is None else
+             0.55 * proposal.feature_score + 0.45 * proposal.cross_encoder_score)
+    return max(value, proposal.unique_short_confidence or 0.0)
 
 
 def _best_per_root(proposals: list[MatchProposal]) -> dict[str, MatchProposal]:
@@ -1475,6 +1567,8 @@ def _best_per_root(proposals: list[MatchProposal]) -> dict[str, MatchProposal]:
 
 
 def _match_method(proposal: MatchProposal) -> str:
+    if proposal.unique_short_confidence is not None:
+        return "rule:unique_short_official"
     if proposal.exact:
         return "exact:normalized"
     if proposal.cross_encoder_score is not None:
@@ -1489,6 +1583,8 @@ def _match_method(proposal: MatchProposal) -> str:
 
 
 def _decision_tier(proposal: MatchProposal, config: dict[str, Any]) -> str:
+    if proposal.unique_short_confidence is not None:
+        return "UNIQUE_SHORT_OFFICIAL"
     if proposal.exact and proposal.candidate_type == "official":
         return "EXACT_OFFICIAL"
     if proposal.exact:

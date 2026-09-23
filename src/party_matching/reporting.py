@@ -7,32 +7,14 @@ from pathlib import Path
 from typing import Any
 
 import xlsxwriter
-from xlsxwriter.utility import xl_col_to_name
 
 from .domain import normalize_name, read_json, read_jsonl, write_json
 
 
-PREDICTION_COLUMNS = [
-    "ADM Party ID", "Source Row", "Dataset Split", "Evaluation Status", "Held-Out",
-    "Scorable", "Exclusion Reason",
-    "Workbook Canonical ID", "Expected Verified ID", "Expected Canonical Name",
-    "Expected Global Parent Name", "Decision", "Correct",
-    "Confidence", "Reason", "Event Emitted", "Predicted Verified ID",
-    "Predicted Verified Name", "Top Candidate Verified ID", "Top Candidate Verified Name",
-    "Matched Member ID", "Matched Member Name",
-    "Matched Candidate Name", "Candidate Type", "Candidate Expansion Confidence", "Matched Mention", "Connector",
-    "Match Method", "Decision Tier", "Retrieval Sources", "Identity Score",
-    "Char TF-IDF Score", "Word TF-IDF Score", "RRF Score", "Char Similarity",
-    "Jaro-Winkler", "Levenshtein", "Token Jaccard", "Raw Coverage", "Candidate Coverage",
-    "Distinctive Token Conflict", "Digit Conflict", "Cross-Encoder Score",
-    "Runner-Up Verified ID", "Runner-Up Score", "Margin", "Graph Path",
-    "Retrieved Root IDs", "Retrieved Root Count", "Expected Target Retrieved", "Expected Target Rank",
-    "Error Bucket", "Has OBO", "Has VIA", "Parse Warning",
-    "Connector Resolution", "Selected Mention Position", "Provisional Verified ID",
-    "Provisional Verified Name", "Mention Results",
-    "Strategy", "Model Version", "Expansion Version", "Graph Schema Version",
-    "Run ID", "System Threshold", "Effective Cutoff",
-    "Case Types",
+DETAIL_COLUMNS = [
+    "Raw Name", "Correct Answer", "Prediction", "Result", "Confidence", "Reason",
+    "Matched Part", "Candidate Considered", "Connector", "Selection Rule",
+    "Review Issue", "Split", "Part Matches",
 ]
 
 
@@ -135,6 +117,9 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
             "Retrieved Root Count": len(retrieved_roots),
             "Expected Target Retrieved": expected_retrieved,
             "Expected Target Rank": expected_rank,
+            "Expected Segment Seen": any(
+                item.get("root_id") == expected for item in decision.get("mention_results") or []
+            ) if expected else False,
             "Has OBO": has_obo,
             "Has VIA": has_via,
             "Parse Warning": decision.get("parse_warning"),
@@ -237,6 +222,12 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
             row for row in held_out
             if (row["prediction"]["Has OBO"] or row["prediction"]["Has VIA"])
             and row["prediction"]["Decision"] == "NO_MATCH"
+        ]),
+        "UNIQUE_SHORT_RULE": summarize([
+            row for row in held_out if row["prediction"]["Decision Tier"] == "UNIQUE_SHORT_OFFICIAL"
+        ]),
+        "PREFERRED_NEAR_CUTOFF": summarize([
+            row for row in held_out if row["prediction"]["Reason"] == "PREFERRED_SEGMENT_NEAR_CUTOFF"
         ]),
     }
     bins = []
@@ -342,7 +333,40 @@ def _write_workbook(
     decimal = workbook.add_format({"font_name": "Arial", "font_size": 10, "num_format": "0.000"})
     percent = workbook.add_format({"font_name": "Arial", "font_size": 10, "num_format": "0.0%"})
 
-    summary = workbook.add_worksheet("Summary")
+    grouped = workbook.add_worksheet("Summary")
+    grouped.hide_gridlines(2)
+    grouped.set_tab_color("#1F4E78")
+    grouped.freeze_panes(1, 1)
+    grouped.write_row(0, 0, ["Resolved (Canonical) Name", "# Raw Names", "Raw Aliases (all matched rows)"], header)
+    raw_name_column = manifest.get("raw_name_column")
+    matched_by_party: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        prediction = row["prediction"]
+        if prediction["Decision"] != "MATCH":
+            continue
+        party_id = str(prediction.get("Predicted Verified ID") or prediction.get("Predicted Verified Name") or "")
+        group = matched_by_party.setdefault(party_id, {
+            "name": str(prediction.get("Predicted Verified Name") or "(unnamed verified party)"),
+            "aliases": [],
+        })
+        group["aliases"].append(str(row["source"].get(raw_name_column) or "(blank raw name)"))
+    row_number = 1
+    for group in sorted(matched_by_party.values(), key=lambda item: (-len(item["aliases"]), item["name"].casefold())):
+        aliases = " | ".join(group["aliases"])
+        for part, start in enumerate(range(0, len(aliases), 32_000)):
+            grouped.write_string(row_number, 0, group["name"], text)
+            if part == 0:
+                grouped.write_number(row_number, 1, len(group["aliases"]), integer)
+            grouped.write_string(row_number, 2, aliases[start:start + 32_000], text)
+            row_number += 1
+    grouped.set_row(0, 30)
+    grouped.set_column("A:A", 48)
+    grouped.set_column("B:B", 16)
+    grouped.set_column("C:C", 110)
+    if row_number > 1:
+        grouped.autofilter(0, 0, row_number - 1, 2)
+
+    summary = workbook.add_worksheet("Stats")
     summary.hide_gridlines(2)
     summary.set_tab_color("#1F4E78")
     summary.write("A2", "Party matching evaluation", title)
@@ -369,6 +393,8 @@ def _write_workbook(
         ("Matching runtime (seconds)", run_stats.get("total_seconds"), decimal),
         ("System threshold", run_stats.get("system_threshold"), decimal),
         ("Effective cutoff", run_stats.get("effective_cutoff"), decimal),
+        ("Held-out unique-short matches", metrics["cohorts"]["UNIQUE_SHORT_RULE"]["matches"], integer),
+        ("Held-out preferred-part abstentions", metrics["cohorts"]["PREFERRED_NEAR_CUTOFF"]["rows"], integer),
     ]
     profile_keys = (
         "graph_seconds", "index_seconds", "retrieval_seconds", "retrieval_query_seconds", "char_matrix_seconds",
@@ -406,7 +432,7 @@ def _write_workbook(
                 summary.write(row_number, column, values[key], percent)
 
     cohort_start = split_start + 4 + len(metrics["by_split"])
-    _section_band(summary, cohort_start, 0, 8, "Held-out connector cohorts", section)
+    _section_band(summary, cohort_start, 0, 8, "Held-out review cohorts", section)
     summary.write_row(cohort_start + 1, 0, ["Cohort", "Rows", "Scorable", "Matches", "Correct", "Precision", "Recall", "Coverage", "Retrieval recall"], header)
     for row_number, (cohort, values) in enumerate(metrics["cohorts"].items(), start=cohort_start + 2):
         summary.write(row_number, 0, cohort, text)
@@ -443,55 +469,45 @@ def _write_workbook(
         summary.write(row_number, 0, stage, text)
         summary.write(row_number, 1, value, integer)
 
-    canonical_start = funnel_start + 4 + len(metrics["funnel"])
-    _section_band(summary, canonical_start, 0, 9, "Results by expected canonical name", section)
-    canonical_headers = ["Expected canonical name", "Rows", "Matches", "Correct", "Precision"]
-    summary.write_row(canonical_start + 1, 0, canonical_headers, header)
-    summary.write(canonical_start + 1, 9, "Raw aliases", header)
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        canonical = str(row["prediction"].get("Expected Canonical Name") or "UNKNOWN")
-        grouped[canonical].append(row)
-    for row_number, canonical in enumerate(sorted(grouped, key=str.casefold), start=canonical_start + 2):
-        group = grouped[canonical]
-        matched = [row for row in group if row["prediction"]["Decision"] == "MATCH"]
-        correct = [row for row in matched if row["prediction"]["Correct"]]
-        aliases = " | ".join(
-            str(value) for value in (row["source"].get(manifest.get("raw_name_column")) for row in group)
-            if value is not None and str(value).strip()
-        )
-        if len(aliases) > 32_000:
-            aliases = aliases[:31_970] + " ... [truncated; Detail is authoritative]"
-        summary.write(row_number, 0, canonical, text)
-        summary.write(row_number, 1, len(group), integer)
-        summary.write(row_number, 2, len(matched), integer)
-        summary.write(row_number, 3, len(correct), integer)
-        if matched:
-            summary.write(row_number, 4, len(correct) / len(matched), percent)
-        summary.write(row_number, 9, aliases, text)
     summary.set_column("A:A", 42)
     summary.set_column("B:E", 14)
     summary.set_column("F:I", 16)
-    summary.set_column("J:J", 80)
     summary.set_row(split_start + 1, 30)
 
     detail = workbook.add_worksheet("Detail")
     detail.hide_gridlines(2)
     detail.freeze_panes(1, 3)
-    raw_column, label_column = manifest.get("raw_name_column"), manifest.get("canonical_name_column")
-    source_columns = [column for column in manifest.get("source_columns", []) if column not in {raw_column, label_column}]
-    first_columns = ["Raw Name", "Label", "Prediction", "Expected Global Parent", "Correct", "Decision"]
-    prediction_columns = [column for column in PREDICTION_COLUMNS if column not in {"Correct", "Decision"}]
-    columns = first_columns + source_columns + prediction_columns
-    detail.write_row(0, 0, columns, header)
+    detail.write_row(0, 0, DETAIL_COLUMNS, header)
     for row_number, row in enumerate(rows, start=1):
         prediction = row["prediction"]
-        values = [row["source"].get(raw_column), row["source"].get(label_column),
-                  prediction.get("Predicted Verified Name") or "NO_MATCH",
-                  prediction.get("Expected Global Parent Name"), prediction.get("Correct"),
-                  prediction.get("Decision")]
-        values.extend(row["source"].get(column) for column in source_columns)
-        values.extend(prediction.get(column) for column in prediction_columns)
+        is_match = prediction["Decision"] == "MATCH"
+        correct_answer = prediction.get("Expected Global Parent Name") or prediction.get("Expected Canonical Name")
+        if str(correct_answer or "").upper() == "UNKNOWN":
+            correct_answer = None
+        result = (
+            "Not scored" if not prediction["Scorable"] else
+            "Correct" if prediction["Correct"] else
+            "Wrong match" if is_match else "No match"
+        )
+        values = [
+            row["source"].get(manifest.get("raw_name_column")),
+            correct_answer,
+            prediction.get("Predicted Verified Name") if is_match else "NO_MATCH",
+            result,
+            prediction.get("Confidence") or None,
+            prediction.get("Reason"),
+            prediction.get("Matched Mention"),
+            None if is_match else (prediction.get("Provisional Verified Name") or prediction.get("Top Candidate Verified Name")),
+            prediction.get("Connector"),
+            (
+                (str(prediction.get("Connector Resolution") or "") + "; unique short name").strip("; ")
+                if prediction.get("Decision Tier") == "UNIQUE_SHORT_OFFICIAL"
+                else prediction.get("Connector Resolution")
+            ),
+            _review_issue(prediction),
+            prediction.get("Dataset Split"),
+            prediction.get("Mention Results"),
+        ]
         for column, value in enumerate(values):
             if isinstance(value, (list, tuple, set)):
                 value = _join(value)
@@ -504,34 +520,21 @@ def _write_workbook(
                 detail.write_blank(row_number, column, None, text)
             else:
                 detail.write_string(row_number, column, str(value)[:32_767], text)
-    detail.autofilter(0, 0, len(rows), len(columns) - 1)
+    detail.autofilter(0, 0, len(rows), len(DETAIL_COLUMNS) - 1)
     detail.set_row(0, 30)
-    for column, name in enumerate(columns):
-        width = 18
-        lowered = name.casefold()
-        if "name" in lowered or "path" in lowered or "sources" in lowered or "reason" in lowered:
-            width = 30
-        elif "id" in lowered:
-            width = 38
+    for column, width in enumerate((44, 38, 38, 16, 14, 27, 30, 38, 13, 20, 29, 17, 70)):
         detail.set_column(column, column, width)
-    decision_column = columns.index("Decision")
-    correct_column = columns.index("Correct")
     match_format = workbook.add_format({"bg_color": "#E2F0D9", "font_color": "#275D38"})
     no_match_format = workbook.add_format({"bg_color": "#FCE8E6", "font_color": "#9C2F24"})
     if rows:
-        detail.conditional_format(1, decision_column, len(rows), decision_column, {
-            "type": "cell", "criteria": "==", "value": '"MATCH"', "format": match_format,
+        detail.conditional_format(1, 3, len(rows), 3, {
+            "type": "cell", "criteria": "==", "value": '"Correct"', "format": match_format,
         })
-        detail.conditional_format(1, decision_column, len(rows), decision_column, {
-            "type": "cell", "criteria": "==", "value": '"NO_MATCH"', "format": no_match_format,
+        detail.conditional_format(1, 3, len(rows), 3, {
+            "type": "cell", "criteria": "==", "value": '"Wrong match"', "format": no_match_format,
         })
-        scorable_column = columns.index("Scorable")
-        scorable_ref = xl_col_to_name(scorable_column)
-        correct_ref = xl_col_to_name(correct_column)
-        detail.conditional_format(1, correct_column, len(rows), correct_column, {
-            "type": "formula",
-            "criteria": f"=AND(${scorable_ref}2=TRUE,${correct_ref}2=FALSE)",
-            "format": no_match_format,
+        detail.conditional_format(1, 3, len(rows), 3, {
+            "type": "cell", "criteria": "==", "value": '"No match"', "format": no_match_format,
         })
     workbook.close()
 
@@ -585,6 +588,20 @@ def _error_bucket(prediction: dict[str, Any]) -> str:
     if prediction.get("Decision") != "MATCH":
         return "REJECTED_AFTER_RETRIEVAL"
     return "RANKING_ERROR"
+
+
+def _review_issue(prediction: dict[str, Any]) -> str:
+    if not prediction["Scorable"] or prediction["Correct"]:
+        return ""
+    if prediction["Reason"] == "PREFERRED_SEGMENT_NEAR_CUTOFF":
+        return "Preferred part near cutoff"
+    if prediction["Reason"] == "CONNECTOR_UNCALIBRATED":
+        return "Connector needs calibration"
+    if (prediction["Has OBO"] or prediction["Has VIA"]) and prediction["Expected Segment Seen"]:
+        return "Wrong connector choice" if prediction["Decision"] == "MATCH" else "Correct part rejected"
+    if not prediction["Expected Target Retrieved"]:
+        return "Correct party not found"
+    return "Wrong party selected" if prediction["Decision"] == "MATCH" else "Candidate rejected"
 
 
 def _section_band(sheet: Any, row: int, first_column: int, last_column: int, label: str, cell_format: Any) -> None:
