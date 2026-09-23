@@ -231,6 +231,11 @@ class FinalDecision:
     graph_path: list[str] = field(default_factory=list)
     retrieved_root_ids: list[str] = field(default_factory=list)
     parse_warning: str | None = None
+    connector_resolution: str | None = None
+    selected_mention_position: int | None = None
+    provisional_party_id: str | None = None
+    provisional_party_name: str | None = None
+    mention_results: list[dict[str, Any]] = field(default_factory=list)
     emitted: bool = False
 
     def to_dict(self) -> dict[str, Any]:

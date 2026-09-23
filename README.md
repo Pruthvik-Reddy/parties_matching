@@ -50,7 +50,7 @@ After copying this source update onto a laptop that already has the same prepare
 ```bash
 python -m pip install .
 python scripts/train.py
-python scripts/run.py --mode parallel --fresh-state --output outputs/exp3
+python scripts/run.py --mode parallel --fresh-state --output outputs/exp4
 ```
 
 Use `--limit 1000` for a quick prefix sample or `--ids-file adm_ids.txt` for a targeted set of ADM IDs.
@@ -75,13 +75,15 @@ Evaluation should use `--fresh-state`. Incremental runs omit that flag and reuse
 - Only verified parties are graph nodes.
 - Expansion candidates retrieve ADM names for their owner. `suggested_parent` never does.
 - Low-confidence LLM candidates and parents are discarded using the configurable expansion thresholds.
-- OBO and via mentions are matched independently; no connector direction is assumed.
+- OBO and VIA segments are matched independently with the normal per-name scoring, guards and cutoff. If one segment matches, it wins; if multiple resolve to the same root, the strongest wins. Distinct roots use the leftmost valid OBO segment or rightmost valid VIA segment. Mixed or malformed connectors abstain. Set `connector_policy = "legacy"` to compare with the earlier pooled behavior.
+- Conflicting-root choices are emitted only when a separate connector gate has enough calibration evidence to meet the precision target. Otherwise the run abstains and shows the provisional choice plus every segment result in the Detail sheet. Retrain after this update; an older artifact has no connector gate.
 - Proposals are grouped by global root before distinct roots compete.
 - Retrieval is bounded by `max_roots_per_mention` and `max_variants_per_root`; cap-hit statistics are written to diagnostics.
 - Headline precision and recall use only untouched `TEST_KNOWN` and `TEST_UNSEEN` rows. Training and calibration results remain visible but are not mixed into the headline.
 - Evaluation resolves each workbook canonical label through the verified graph before comparing it with the emitted global parent.
 - OBO/VIA, no-OBO, no-VIA and plain-name cohorts are reported separately.
 - `UNKNOWN` rows appear in predictions but not supervised metrics.
+- Detail starts with raw name, original workbook label, accepted prediction (or `NO_MATCH`), expected global parent, correctness and decision. Summary shows unknown prediction count and connector-resolution cohorts. `run_stats.json` and `analysis.md` include stage timings and process-memory snapshots; `end_to_end_seconds` includes workbook generation.
 - Rows that already have a verified parent remain in predictions, but are excluded from matching, training, and supervised metrics.
 - The matcher never reads `labels.jsonl`; only reporting and training do.
 - A matcher artifact is rejected when it was trained against a different prepared workbook.

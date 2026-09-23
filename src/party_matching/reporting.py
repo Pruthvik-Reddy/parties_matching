@@ -28,6 +28,8 @@ PREDICTION_COLUMNS = [
     "Runner-Up Verified ID", "Runner-Up Score", "Margin", "Graph Path",
     "Retrieved Root IDs", "Retrieved Root Count", "Expected Target Retrieved", "Expected Target Rank",
     "Error Bucket", "Has OBO", "Has VIA", "Parse Warning",
+    "Connector Resolution", "Selected Mention Position", "Provisional Verified ID",
+    "Provisional Verified Name", "Mention Results",
     "Strategy", "Model Version", "Expansion Version", "Graph Schema Version",
     "Run ID", "System Threshold", "Effective Cutoff",
     "Case Types",
@@ -136,6 +138,15 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
             "Has OBO": has_obo,
             "Has VIA": has_via,
             "Parse Warning": decision.get("parse_warning"),
+            "Connector Resolution": decision.get("connector_resolution"),
+            "Selected Mention Position": decision.get("selected_mention_position"),
+            "Provisional Verified ID": decision.get("provisional_party_id"),
+            "Provisional Verified Name": decision.get("provisional_party_name"),
+            "Mention Results": " | ".join(
+                f"{item['position']}: {item['text']} -> {item.get('root_name') or 'NO_MATCH'} "
+                f"({item['reason']}, {item['confidence']:.3f})"
+                for item in decision.get("mention_results") or []
+            ),
             "Strategy": run_stats.get("strategy"),
             "Model Version": run_stats.get("model_version"),
             "Expansion Version": run_stats.get("expansion_version"),
@@ -165,22 +176,23 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
 def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> dict[str, Any]:
     def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         scorable = [row for row in rows if row["prediction"]["Scorable"]]
-        matches = [row for row in scorable if row["prediction"]["Decision"] == "MATCH"]
-        correct = [row for row in matches if row["prediction"]["Correct"]]
+        matches = [row for row in rows if row["prediction"]["Decision"] == "MATCH"]
+        scored_matches = [row for row in matches if row["prediction"]["Scorable"]]
+        correct = [row for row in scored_matches if row["prediction"]["Correct"]]
         retrieved = [row for row in scorable if row["prediction"]["Expected Target Retrieved"]]
-        interval = _wilson_interval(len(correct), len(matches)) if matches else (None, None)
+        interval = _wilson_interval(len(correct), len(scored_matches)) if scored_matches else (None, None)
         return {
             "rows": len(rows),
             "scorable": len(scorable),
             "matches": len(matches),
             "correct_matches": len(correct),
-            "precision": len(correct) / len(matches) if matches else None,
+            "precision": len(correct) / len(scored_matches) if scored_matches else None,
             "precision_ci_95_low": interval[0],
             "precision_ci_95_high": interval[1],
             "recall": len(correct) / len(scorable) if scorable else None,
             # Backward-compatible alias for any existing consumers of metrics.json.
             "correct_match_recall": len(correct) / len(scorable) if scorable else None,
-            "coverage": len(matches) / len(scorable) if scorable else None,
+            "coverage": len(scored_matches) / len(scorable) if scorable else None,
             "retrieval_recall": len(retrieved) / len(scorable) if scorable else None,
         }
     held_out = [row for row in detail_rows if row["prediction"]["Held-Out"]]
@@ -217,6 +229,14 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
         "OBO_AND_VIA": summarize([
             row for row in held_out
             if row["prediction"]["Has OBO"] and row["prediction"]["Has VIA"]
+        ]),
+        "CONNECTOR_ONE_VALID": summarize([row for row in held_out if row["prediction"]["Connector Resolution"] == "ONLY_MATCH"]),
+        "CONNECTOR_SAME_ROOT": summarize([row for row in held_out if row["prediction"]["Connector Resolution"] == "SAME_ROOT"]),
+        "CONNECTOR_CONFLICT": summarize([row for row in held_out if str(row["prediction"]["Connector Resolution"] or "").startswith(("OBO_", "VIA_"))]),
+        "CONNECTOR_ABSTAINED": summarize([
+            row for row in held_out
+            if (row["prediction"]["Has OBO"] or row["prediction"]["Has VIA"])
+            and row["prediction"]["Decision"] == "NO_MATCH"
         ]),
     }
     bins = []
@@ -327,7 +347,9 @@ def _write_workbook(
     summary.set_tab_color("#1F4E78")
     summary.write("A2", "Party matching evaluation", title)
     _section_band(summary, 3, 0, 1, "Run summary", section)
+    _section_band(summary, 3, 11, 12, "Matching stage profile", section)
     summary.write_row("A5", ["Metric", "Value"], header)
+    summary.write_row(4, 11, ["Stage", "Seconds / MB"], header)
     overall = metrics["overall"]
     summary_values = [
         ("All source rows", run_stats.get("records"), integer),
@@ -343,18 +365,35 @@ def _write_workbook(
         ("Held-out coverage", overall["coverage"], percent),
         ("Held-out retrieval recall", overall["retrieval_recall"], percent),
         ("Unknown rows (not scored)", metrics["unknown_predictions"]["rows"], integer),
+        ("Unknown predicted matches", metrics["unknown_predictions"]["matches"], integer),
         ("Matching runtime (seconds)", run_stats.get("total_seconds"), decimal),
         ("System threshold", run_stats.get("system_threshold"), decimal),
         ("Effective cutoff", run_stats.get("effective_cutoff"), decimal),
     ]
-    for row_number, (label, value, value_format) in enumerate(summary_values, start=5):
-        summary.write(row_number, 0, label, text)
-        if value is None:
-            summary.write_blank(row_number, 1, None, value_format)
-        else:
-            summary.write(row_number, 1, value, value_format)
+    profile_keys = (
+        "graph_seconds", "index_seconds", "retrieval_seconds", "retrieval_query_seconds", "char_matrix_seconds",
+        "word_matrix_seconds", "shortlist_seconds", "proposal_build_seconds",
+        "identity_feature_seconds", "identity_model_seconds", "decision_seconds",
+        "write_seconds", "peak_rss_mb",
+    )
+    for offset in range(max(len(summary_values), len(profile_keys))):
+        row_number = offset + 5
+        if offset < len(summary_values):
+            label, value, value_format = summary_values[offset]
+            summary.write(row_number, 0, label, text)
+            if value is None:
+                summary.write_blank(row_number, 1, None, value_format)
+            else:
+                summary.write(row_number, 1, value, value_format)
+        if offset < len(profile_keys):
+            key = profile_keys[offset]
+            summary.write(row_number, 11, key, text)
+            if run_stats.get(key) is not None:
+                summary.write_number(row_number, 12, float(run_stats[key]), decimal)
+    summary.set_column("L:L", 32)
+    summary.set_column("M:M", 17)
 
-    split_start = 23
+    split_start = 24
     _section_band(summary, split_start, 0, 8, "Metrics by dataset split", section)
     split_headers = ["Split", "Rows", "Scorable", "Matches", "Correct", "Precision", "Recall", "Coverage", "Retrieval recall"]
     summary.write_row(split_start + 1, 0, split_headers, header)
@@ -438,13 +477,21 @@ def _write_workbook(
 
     detail = workbook.add_worksheet("Detail")
     detail.hide_gridlines(2)
-    detail.freeze_panes(1, 2)
-    source_columns = list(manifest.get("source_columns", []))
-    columns = source_columns + PREDICTION_COLUMNS
+    detail.freeze_panes(1, 3)
+    raw_column, label_column = manifest.get("raw_name_column"), manifest.get("canonical_name_column")
+    source_columns = [column for column in manifest.get("source_columns", []) if column not in {raw_column, label_column}]
+    first_columns = ["Raw Name", "Label", "Prediction", "Expected Global Parent", "Correct", "Decision"]
+    prediction_columns = [column for column in PREDICTION_COLUMNS if column not in {"Correct", "Decision"}]
+    columns = first_columns + source_columns + prediction_columns
     detail.write_row(0, 0, columns, header)
     for row_number, row in enumerate(rows, start=1):
-        values = [row["source"].get(column) for column in source_columns]
-        values.extend(row["prediction"].get(column) for column in PREDICTION_COLUMNS)
+        prediction = row["prediction"]
+        values = [row["source"].get(raw_column), row["source"].get(label_column),
+                  prediction.get("Predicted Verified Name") or "NO_MATCH",
+                  prediction.get("Expected Global Parent Name"), prediction.get("Correct"),
+                  prediction.get("Decision")]
+        values.extend(row["source"].get(column) for column in source_columns)
+        values.extend(prediction.get(column) for column in prediction_columns)
         for column, value in enumerate(values):
             if isinstance(value, (list, tuple, set)):
                 value = _join(value)
@@ -502,6 +549,12 @@ def _write_analysis(path: Path, metrics: dict[str, Any], run_stats: dict[str, An
         f"- Held-out retrieval recall: {_display_rate(overall['retrieval_recall'])}",
         f"- Held-out macro entity recall: {_display_rate(metrics.get('macro_entity_recall'))}",
         f"- Matching runtime: {float(run_stats.get('total_seconds', 0)):.2f} seconds",
+        f"- Unknown predicted matches (not scored): {metrics['unknown_predictions']['matches']}",
+        "",
+        "## Stage profile",
+        "",
+        *[f"- {key}: {value:.2f}" for key, value in run_stats.items()
+          if (key.endswith("_seconds") or key.endswith("_rss_mb")) and isinstance(value, (int, float))],
         "",
         "## Limitations",
         "",
