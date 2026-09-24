@@ -8,7 +8,8 @@ from party_matching.graph import VerifiedGraph
 from party_matching.matching import FeatureScorer
 from party_matching.reporting import _write_rules_changes
 from party_matching.rules_enhancement import (
-    _anchored_official_prefix, _minor_spelling_variant, _recover_second_pass, _root_prefix_index, _root_token_index,
+    _anchored_official_prefix, _minor_spelling_variant, _recover_regional, _recover_second_pass,
+    _regional_qualifier_evidence, _root_prefix_index, _root_token_index,
     _unique_short_name, _unsafe_removed,
     enhance_rules_decisions, name_views, soft_token_coverage,
 )
@@ -218,6 +219,77 @@ class EnhancedRulesTests(unittest.TestCase):
         self.assertFalse(
             _minor_spelling_variant("Carasoft Technology Partner", "Carahsoft Technology Corp.", {})
         )
+
+    def test_regional_route_adds_only_unambiguous_geographic_variant(self):
+        self.graph.add_parties([{"partyId": "acme", "partyName": "Acme Corp."}])
+        raw = "Acme Brazil Corp"
+        record = PartyRecord("account", "regional", raw, 1)
+        proposal = self.proposal("regional", raw, "acme", "Acme Corp.")
+        old = self.rejected("regional", raw, "acme", "Acme Corp.")
+        enhanced = {"regional": old}
+        previous, stats = _recover_regional(
+            [record], {"regional": [proposal]}, enhanced, self.graph,
+            {}, {"confidenceCutoff": 0.0},
+        )
+        self.assertIs(previous["regional"], old)
+        self.assertEqual(stats["matches"], 1)
+        self.assertEqual(enhanced["regional"].verified_party_id, "acme")
+        self.assertEqual(enhanced["regional"].confidence, proposal.rules_score)
+        self.assertEqual(enhanced["regional"].match_method,
+                         "rules:regional_heuristic_not_proven_ownership")
+        self.assertEqual(enhanced["regional"].reason,
+                         "REGIONAL_HEURISTIC_NOT_PROVEN_OWNERSHIP")
+
+    def test_regional_route_rejects_unknown_context_and_weak_lexical_signal(self):
+        self.graph.add_parties([{"partyId": "acme", "partyName": "Acme Corp."}])
+        for raw in ("Acme Brazil Analytics Corp", "Acme Brazil Holdings Corp", "Acme Division Corp"):
+            item = self.proposal("raw", raw, "acme", "Acme Corp.")
+            self.assertFalse(_regional_qualifier_evidence(
+                raw, item, {("acme",): {"acme"}},
+            ))
+        weak = self.proposal("raw", "Acme Brazil Corp", "acme", "Acme Corp.")
+        weak.char_tfidf_score = weak.word_tfidf_score = 0.54
+        self.assertFalse(_regional_qualifier_evidence(
+            "Acme Brazil Corp", weak, {("acme",): {"acme"}},
+        ))
+
+    def test_regional_route_abstains_for_separate_verified_family_roots(self):
+        self.graph.add_parties([
+            {"partyId": "ingram-inc", "partyName": "Ingram Micro Inc."},
+            {"partyId": "ingram-other", "partyName": "Ingram Micro"},
+        ])
+        raw = "Ingram Micro USA"
+        record = PartyRecord("account", "ingram-regional", raw, 1)
+        proposal = self.proposal(record.adm_party_id, raw, "ingram-inc", "Ingram Micro Inc.")
+        old = self.rejected(record.adm_party_id, raw, "ingram-inc", "Ingram Micro Inc.")
+        enhanced = {record.adm_party_id: old}
+        previous, _ = _recover_regional(
+            [record], {record.adm_party_id: [proposal]}, enhanced, self.graph,
+            {}, {"confidenceCutoff": 0.0},
+        )
+        self.assertFalse(previous)
+        self.assertIs(enhanced[record.adm_party_id], old)
+
+    def test_regional_flag_is_additive_to_existing_enhancement(self):
+        self.graph.add_parties([{"partyId": "acme", "partyName": "Acme Corp."}])
+        raw = "Acme Brazil Corp"
+        record = PartyRecord("account", "regional", raw, 1)
+        proposal = self.proposal("regional", raw, "acme", "Acme Corp.")
+        old = self.rejected("regional", raw, "acme", "Acme Corp.")
+        retriever = SimpleNamespace(char_vectorizer=None, word_vectorizer=None)
+        disabled, _ = enhance_rules_decisions(
+            [record], {"regional": [proposal]}, [old], self.graph, retriever,
+            self.scorer, self.config, {}, {"confidenceCutoff": 0.0},
+        )
+        self.config["decision"]["rules_regional_enabled"] = True
+        enabled, stats = enhance_rules_decisions(
+            [record], {"regional": [proposal]}, [old], self.graph, retriever,
+            self.scorer, self.config, {}, {"confidenceCutoff": 0.0},
+        )
+        self.assertEqual(disabled[0].decision, "NO_MATCH")
+        self.assertEqual(enabled[0].decision, "MATCH")
+        self.assertEqual(stats["regional"]["matches"], 1)
+        self.assertIs(stats["_regional_previous"]["regional"], old)
 
     def test_changed_rows_audit_marks_correctness_without_touching_excel(self):
         rows = [{"source": {"raw": "Carahsoft Technology - Partner"},

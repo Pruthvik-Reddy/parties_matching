@@ -1120,6 +1120,7 @@ def run_matching(
         rules_trace_stats["seconds"] = time.perf_counter() - trace_started
     rules_enhancement_stats = None
     second_pass_previous: dict[str, FinalDecision] = {}
+    regional_previous: dict[str, FinalDecision] = {}
     if bool(config.get("decision", {}).get("rules_enhanced_enabled", False)):
         from .rules_enhancement import enhance_rules_decisions
         enhanced_started = time.perf_counter()
@@ -1129,15 +1130,23 @@ def run_matching(
             graph, retriever, rules_scorer, config, party_job, default_job,
         )
         second_pass_previous = rules_enhancement_stats.pop("_second_pass_previous", {})
+        regional_previous = rules_enhancement_stats.pop("_regional_previous", {})
         enhanced_by_id = {decision.adm_party_id: decision for decision in rules_decisions}
         rules_decisions = [enhanced_by_id.get(record.adm_party_id, rules_by_id[record.adm_party_id])
                            for record in records]
         rules_enhancement_stats["seconds"] = time.perf_counter() - enhanced_started
     # Retain the exact pre-pass rules decisions in the same run. This allows a
     # label-based comparison without changing ML decisions, events, or mappings.
-    rules_pre_second_pass = [second_pass_previous.get(item.adm_party_id, item) for item in rules_decisions]
+    rules_pre_second_pass = [
+        second_pass_previous.get(item.adm_party_id, regional_previous.get(item.adm_party_id, item))
+        for item in rules_decisions
+    ]
+    rules_pre_regional = [regional_previous.get(item.adm_party_id, item) for item in rules_decisions]
     second_pass_comparison = _compare_rules_second_pass(
-        prepared / "labels.jsonl", graph, rules_pre_second_pass, rules_decisions,
+        prepared / "labels.jsonl", graph, rules_pre_second_pass, rules_pre_regional,
+    )
+    regional_comparison = _compare_rules_second_pass(
+        prepared / "labels.jsonl", graph, rules_pre_regional, rules_decisions,
     )
     events: list[dict[str, Any]] = []
     for update in graph_updates:
@@ -1186,8 +1195,11 @@ def run_matching(
     write_jsonl(output / "rules_decisions.jsonl", (decision.to_dict() for decision in rules_decisions))
     write_jsonl(output / "rules_pre_second_pass_decisions.jsonl",
                 (decision.to_dict() for decision in rules_pre_second_pass))
+    write_jsonl(output / "rules_pre_regional_decisions.jsonl",
+                (decision.to_dict() for decision in rules_pre_regional))
     write_jsonl(output / "rules_baseline_decisions.jsonl", (decision.to_dict() for decision in baseline_rules_decisions))
     write_json(output / "rules_second_pass_comparison.json", second_pass_comparison)
+    write_json(output / "rules_regional_comparison.json", regional_comparison)
     write_jsonl(output / "events.jsonl", events)
     if new_mappings and not fresh_state:
         existing = list(read_jsonl(mapping_path)) if mapping_path.exists() else []
@@ -1219,6 +1231,8 @@ def run_matching(
         "rules_multiword_prefix_enabled": bool(config.get("decision", {}).get("rules_multiword_prefix_enabled", False)),
         "rules_second_pass_enabled": bool(config.get("decision", {}).get("rules_second_pass_enabled", False)),
         "rules_second_pass_comparison": second_pass_comparison,
+        "rules_regional_enabled": bool(config.get("decision", {}).get("rules_regional_enabled", False)),
+        "rules_regional_comparison": regional_comparison,
         "rules_connector_short_name_matches": sum(
             decision.decision == "MATCH" and decision.decision_tier in {
                 "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME", "RULES_ROOT_UNIQUE_CONNECTOR_PREFIX",

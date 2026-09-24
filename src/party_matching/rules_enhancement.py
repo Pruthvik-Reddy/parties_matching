@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from .domain import LEGAL_SUFFIXES, FinalDecision, MatchProposal, PartyRecord, base_name, compact_name, normalize_name, parse_mentions
+from .regional_terms import IGNORED_LEGAL_TOKENS, explain_region_tokens
 
 
 SEPARATOR = re.compile(r"-{2,}|\s+[-–—|/]\s*|\s*[-–—|/]\s+")
@@ -346,6 +347,62 @@ def _minor_spelling_variant(raw: str, official: str, idf: dict[str, float]) -> b
     return min(coverage) >= 0.88
 
 
+def _regional_core_tokens(name: str) -> tuple[str, ...]:
+    """Keep every substantive official token; remove articles and legal forms."""
+    tokens = normalize_name(name).split()
+    while tokens and tokens[0] in {"the", "a", "an"}:
+        tokens.pop(0)
+    return tuple(token for token in tokens if token not in IGNORED_LEGAL_TOKENS)
+
+
+def _regional_core_root_index(
+    graph: Any, wanted: set[tuple[str, ...]],
+) -> dict[tuple[str, ...], set[str]]:
+    """Index only queried cores; another root extending one makes it unsafe."""
+    roots: dict[tuple[str, ...], set[str]] = defaultdict(set)
+    if not wanted:
+        return roots
+    for party_id, node in graph.nodes.items():
+        tokens = _regional_core_tokens(node.party_name)
+        root = graph.root_id(party_id)
+        for length in range(1, len(tokens) + 1):
+            prefix = tokens[:length]
+            if prefix in wanted:
+                roots[prefix].add(root)
+    return roots
+
+
+def _regional_qualifier_evidence(
+    raw_name: str, item: MatchProposal,
+    core_roots: dict[tuple[str, ...], set[str]],
+) -> bool:
+    """Require one complete unique name core plus fully explainable geography.
+
+    This is only a textual family heuristic. It does not prove ownership or
+    merge separately verified regional entities.
+    """
+    if (item.candidate_type != "official" or item.candidate_collision_count != 1
+            or item.digit_conflict or item.distinctive_token_conflict
+            or max(item.char_tfidf_score, item.word_tfidf_score) < 0.55
+            or item.rules_score < 0.35):
+        return False
+    core = _regional_core_tokens(item.matched_name)
+    if not core or (len(core) == 1 and len(core[0]) < 4):
+        return False
+    if core_roots.get(core) != {item.root_party_id}:
+        return False
+    raw = _regional_core_tokens(raw_name)
+    for start in range(len(raw) - len(core) + 1):
+        if raw[start:start + len(core)] != core:
+            continue
+        extra = list(raw[:start] + raw[start + len(core):])
+        if extra:
+            explained, has_location = explain_region_tokens(extra)
+            if explained and has_location:
+                return True
+    return False
+
+
 def _second_pass_evidence(
     record: PartyRecord, item: MatchProposal, proposals: list[MatchProposal],
     root_tokens: dict[str, set[str]], root_prefixes: dict[str, set[str]],
@@ -432,12 +489,15 @@ def _recover_second_pass(
         previous[record.adm_party_id] = old
         enhanced[record.adm_party_id] = FinalDecision(
             account_id=record.account_id, adm_party_id=record.adm_party_id, raw_name=record.raw_name,
-            decision="MATCH", confidence=winner.rules_score, reason="MATCH",
+            decision="MATCH", confidence=winner.rules_score,
+            reason="MATCH",
             verified_party_id=winner.root_party_id, verified_party_name=winner.root_party_name,
             matched_member_id=winner.owner_party_id, matched_member_name=winner.owner_party_name,
             matched_candidate_name=winner.matched_name, matched_candidate_type=winner.candidate_type,
             candidate_expansion_confidence=winner.candidate_confidence, matched_mention=winner.mention_text,
-            match_method=f"rules:second_pass_{kind.lower()}", decision_tier=f"RULES_SECOND_PASS_{kind}",
+            match_method=("rules:regional_heuristic_not_proven_ownership" if kind == "REGIONAL_QUALIFIER"
+                          else f"rules:second_pass_{kind.lower()}"),
+            decision_tier=f"RULES_SECOND_PASS_{kind}",
             retrieval_sources=winner.retrieval_sources, identity_score=winner.rules_score,
             char_tfidf_score=winner.char_tfidf_score, word_tfidf_score=winner.word_tfidf_score,
             rrf_score=winner.rrf_score, char_similarity=winner.char_similarity,
@@ -452,6 +512,83 @@ def _recover_second_pass(
         )
         counts["matches"] += 1
         counts[kind.lower()] += 1
+    return previous, dict(counts)
+
+
+def _recover_regional(
+    records: list[PartyRecord], proposals_by_record: dict[str, list[MatchProposal]],
+    enhanced: dict[str, FinalDecision], graph: Any,
+    party_job: dict[str, dict], default_job: dict,
+) -> tuple[dict[str, FinalDecision], dict[str, int]]:
+    """Add only regional matches to remaining plain NO_MATCH rows.
+
+    All preceding enhanced-rules decisions are frozen. Separately verified
+    regional variants make a core non-unique and cause abstention.
+    """
+    previous: dict[str, FinalDecision] = {}
+    counts: dict[str, int] = defaultdict(int)
+    # The full verified graph can be large. Keep only official cores that a
+    # remaining rejected row might use; do not materialize every prefix.
+    wanted = {
+        _regional_core_tokens(item.matched_name)
+        for record in records if enhanced[record.adm_party_id].decision == "NO_MATCH"
+        for item in proposals_by_record.get(record.adm_party_id, [])
+        if item.candidate_type == "official"
+        and max(item.char_tfidf_score, item.word_tfidf_score) >= 0.55
+    }
+    core_roots = _regional_core_root_index(graph, wanted)
+    for record in records:
+        old = enhanced[record.adm_party_id]
+        if old.decision != "NO_MATCH":
+            continue
+        mentions = parse_mentions(record)
+        if len(mentions) != 1 or mentions[0].parse_warning:
+            continue
+        proposals = proposals_by_record.get(record.adm_party_id, [])
+        if not proposals:
+            continue
+        counts["reviewed"] += 1
+        eligible: dict[str, MatchProposal] = {}
+        for item in proposals:
+            if not _regional_qualifier_evidence(record.raw_name, item, core_roots):
+                continue
+            current = eligible.get(item.root_party_id)
+            if current is None or item.rules_score > current.rules_score:
+                eligible[item.root_party_id] = item
+        if not eligible:
+            continue
+        if len(eligible) != 1:
+            counts["ambiguous"] += 1
+            continue
+        winner = next(iter(eligible.values()))
+        if any(item.root_party_id != winner.root_party_id and item.exact for item in proposals):
+            counts["competing_exact"] += 1
+            continue
+        job = party_job.get(str(winner.owner_party_id), default_job)
+        if winner.rules_score < float(job.get("confidenceCutoff", 0.0)):
+            counts["request_cutoff"] += 1
+            continue
+        previous[record.adm_party_id] = old
+        enhanced[record.adm_party_id] = FinalDecision(
+            account_id=record.account_id, adm_party_id=record.adm_party_id, raw_name=record.raw_name,
+            decision="MATCH", confidence=winner.rules_score,
+            reason="REGIONAL_HEURISTIC_NOT_PROVEN_OWNERSHIP",
+            verified_party_id=winner.root_party_id, verified_party_name=winner.root_party_name,
+            matched_member_id=winner.owner_party_id, matched_member_name=winner.owner_party_name,
+            matched_candidate_name=winner.matched_name, matched_candidate_type=winner.candidate_type,
+            candidate_expansion_confidence=winner.candidate_confidence, matched_mention=winner.mention_text,
+            match_method="rules:regional_heuristic_not_proven_ownership",
+            decision_tier="RULES_REGIONAL_HEURISTIC", retrieval_sources=winner.retrieval_sources,
+            identity_score=winner.rules_score, char_tfidf_score=winner.char_tfidf_score,
+            word_tfidf_score=winner.word_tfidf_score, rrf_score=winner.rrf_score,
+            char_similarity=winner.char_similarity, jaro_winkler=winner.jaro_winkler,
+            levenshtein=winner.levenshtein, token_jaccard=winner.token_jaccard,
+            raw_coverage=winner.raw_coverage, candidate_coverage=winner.candidate_coverage,
+            distinctive_token_conflict=winner.distinctive_token_conflict,
+            digit_conflict=winner.digit_conflict, graph_path=graph.path_to_root(winner.owner_party_id),
+            retrieved_root_ids=old.retrieved_root_ids, margin=old.margin,
+        )
+        counts["matches"] += 1
     return previous, dict(counts)
 
 
@@ -576,10 +713,17 @@ def enhance_rules_decisions(
             records, proposals_by_record, enhanced, graph, scorer, party_job, default_job,
             root_tokens, root_prefixes,
         )
+    regional_previous: dict[str, FinalDecision] = {}
+    regional_stats: dict[str, int] = {}
+    if bool(config.get("decision", {}).get("rules_regional_enabled", False)):
+        regional_previous, regional_stats = _recover_regional(
+            records, proposals_by_record, enhanced, graph, party_job, default_job,
+        )
     result = [enhanced[item.adm_party_id] for item in records]
     return result, {"reviewed_plain_no_matches": reviewed, "view_candidates_scored": view_candidates,
                     "unsafe_views_skipped": unsafe_views, "short_name_matches": short_matches,
                     "multiword_short_name_matches": multiword_short_matches,
                     "safe_view_matches": view_matches, "core_anchor_candidates_scored": core_scored,
                     "core_anchor_matches": core_matches, "unsafe_core_anchors_skipped": core_blocked,
-                    "second_pass": second_stats, "_second_pass_previous": second_previous}
+                    "second_pass": second_stats, "_second_pass_previous": second_previous,
+                    "regional": regional_stats, "_regional_previous": regional_previous}
