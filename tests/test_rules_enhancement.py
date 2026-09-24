@@ -8,7 +8,8 @@ from party_matching.graph import VerifiedGraph
 from party_matching.matching import FeatureScorer
 from party_matching.reporting import _write_rules_changes
 from party_matching.rules_enhancement import (
-    _anchored_official_prefix, _root_prefix_index, _root_token_index, _unique_short_name, _unsafe_removed,
+    _anchored_official_prefix, _minor_spelling_variant, _recover_second_pass, _root_prefix_index, _root_token_index,
+    _unique_short_name, _unsafe_removed,
     enhance_rules_decisions, name_views, soft_token_coverage,
 )
 
@@ -141,6 +142,82 @@ class EnhancedRulesTests(unittest.TestCase):
         self.assertEqual([item.decision for item in result], ["MATCH", "NO_MATCH", "NO_MATCH"])
         self.assertEqual(stats["safe_view_matches"], 1)
         self.assertEqual(baseline[0].decision, "NO_MATCH")
+
+    def test_second_pass_recovers_other_retrieved_root_without_fabricating_score(self):
+        raw = "Carahsoft Technology Corp. - Partner"
+        record = PartyRecord("account", "second", raw, 1)
+        wrong = self.proposal("second", raw, "cooper", "Cooper Holdings, Inc.")
+        correct = self.proposal("second", raw, "carahsoft", "Carahsoft Technology Corp.")
+        old = self.rejected("second", raw, "cooper", "Cooper Holdings, Inc.")
+        enhanced = {"second": old}
+        previous, stats = _recover_second_pass(
+            [record], {"second": [wrong, correct]}, enhanced, self.graph,
+            self.scorer, {}, {"confidenceCutoff": 0.0},
+            _root_token_index(self.graph), _root_prefix_index(self.graph, {raw}),
+        )
+        self.assertIs(previous["second"], old)
+        self.assertEqual(enhanced["second"].verified_party_id, "carahsoft")
+        self.assertEqual(enhanced["second"].confidence, correct.rules_score)
+        self.assertEqual(stats["official_name_with_context"], 1)
+
+    def test_second_pass_abstains_on_competing_name_and_connector(self):
+        raw = "Cooper Holdings, Inc. - Carahsoft Technology Corp."
+        record = PartyRecord("account", "conflict", raw, 1)
+        connector = PartyRecord("account", "connector", "Carahsoft OBO Cooper", 2)
+        proposals = {
+            "conflict": [self.proposal("conflict", raw, "cooper", "Cooper Holdings, Inc."),
+                         self.proposal("conflict", raw, "carahsoft", "Carahsoft Technology Corp.")],
+            "connector": [self.proposal("connector", connector.raw_name, "carahsoft",
+                                        "Carahsoft Technology Corp.")],
+        }
+        enhanced = {"conflict": self.rejected("conflict", raw, "cooper", "Cooper Holdings, Inc."),
+                    "connector": self.rejected("connector", connector.raw_name, "carahsoft",
+                                               "Carahsoft Technology Corp.")}
+        previous, _ = _recover_second_pass(
+            [record, connector], proposals, enhanced, self.graph, self.scorer, {},
+            {"confidenceCutoff": 0.0}, _root_token_index(self.graph),
+            _root_prefix_index(self.graph, {raw, connector.raw_name}),
+        )
+        self.assertFalse(previous)
+        self.assertEqual(enhanced["conflict"].decision, "NO_MATCH")
+        self.assertEqual(enhanced["connector"].decision, "NO_MATCH")
+
+    def test_second_pass_legal_suffix_does_not_collapse_separate_roots(self):
+        self.graph.add_parties([{"partyId": "qbs-limited", "partyName": "QBS Software Limited"}])
+        raw = "QBS Software Ltd"
+        record = PartyRecord("account", "qbs-raw", raw, 1)
+        proposal = self.proposal(record.adm_party_id, raw, "qbs-limited", "QBS Software Limited")
+        old = self.rejected(record.adm_party_id, raw, "qbs-limited", "QBS Software Limited")
+        enhanced = {record.adm_party_id: old}
+        kwargs = ( [record], {record.adm_party_id: [proposal]}, enhanced, self.graph,
+                   self.scorer, {}, {"confidenceCutoff": 0.0}, _root_token_index(self.graph),
+                   _root_prefix_index(self.graph, {raw}) )
+        _recover_second_pass(*kwargs)
+        self.assertEqual(enhanced[record.adm_party_id].decision_tier,
+                         "RULES_SECOND_PASS_LEGAL_SUFFIX_VARIANT")
+        self.graph.add_parties([{"partyId": "qbs-ltd", "partyName": "QBS Software Ltd"}])
+        enhanced[record.adm_party_id] = old
+        _recover_second_pass(*kwargs)
+        self.assertEqual(enhanced[record.adm_party_id].decision, "NO_MATCH")
+
+    def test_second_pass_allows_only_a_small_complete_name_typo(self):
+        raw = "Carasoft Technology"
+        record = PartyRecord("account", "typo", raw, 1)
+        proposal = self.proposal("typo", raw, "carahsoft", "Carahsoft Technology Corp.")
+        proposal.rules_score = 0.50
+        old = self.rejected("typo", raw, "carahsoft", "Carahsoft Technology Corp.")
+        enhanced = {"typo": old}
+        _recover_second_pass(
+            [record], {"typo": [proposal]}, enhanced, self.graph, self.scorer, {},
+            {"confidenceCutoff": 0.0}, _root_token_index(self.graph),
+            _root_prefix_index(self.graph, {raw}),
+        )
+        self.assertEqual(enhanced["typo"].decision_tier,
+                         "RULES_SECOND_PASS_MINOR_SPELLING_VARIANT")
+        self.assertEqual(enhanced["typo"].confidence, 0.50)
+        self.assertFalse(
+            _minor_spelling_variant("Carasoft Technology Partner", "Carahsoft Technology Corp.", {})
+        )
 
     def test_changed_rows_audit_marks_correctness_without_touching_excel(self):
         rows = [{"source": {"raw": "Carahsoft Technology - Partner"},

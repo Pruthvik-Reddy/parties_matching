@@ -915,6 +915,44 @@ def decide_records(
     return [by_id[record.adm_party_id] for record in records]
 
 
+def _compare_rules_second_pass(
+    labels_path: Path, graph: VerifiedGraph,
+    before: list[FinalDecision], after: list[FinalDecision],
+) -> dict[str, Any]:
+    """Measure this rules-only addition on held-out labels after inference.
+
+    Labels are deliberately consulted only here, never inside the matcher.
+    """
+    labels = {row["adm_party_id"]: row for row in read_jsonl(labels_path)}
+    counts = {"rows": 0, "before_matches": 0, "before_correct": 0,
+              "after_matches": 0, "after_correct": 0, "new_correct": 0, "new_wrong": 0}
+    for old, new in zip(before, after):
+        label = labels.get(old.adm_party_id, {})
+        if not label.get("scorable") or label.get("split") not in {"TEST_KNOWN", "TEST_UNSEEN"}:
+            continue
+        expected = label.get("expected_party_id")
+        if expected in graph.nodes:
+            expected = graph.root_id(expected)
+        counts["rows"] += 1
+        old_match = old.decision == "MATCH"
+        new_match = new.decision == "MATCH"
+        counts["before_matches"] += old_match
+        counts["after_matches"] += new_match
+        counts["before_correct"] += old_match and old.verified_party_id == expected
+        counts["after_correct"] += new_match and new.verified_party_id == expected
+        if not old_match and new_match:
+            counts["new_correct" if new.verified_party_id == expected else "new_wrong"] += 1
+
+    def metrics(prefix: str) -> dict[str, float | int | None]:
+        matches, correct, rows = counts[f"{prefix}_matches"], counts[f"{prefix}_correct"], counts["rows"]
+        precision = correct / matches if matches else None
+        recall = correct / rows if rows else None
+        f1 = 2 * precision * recall / (precision + recall) if precision is not None and recall is not None and precision + recall else None
+        return {"matches": matches, "correct": correct, "precision": precision, "recall": recall, "f1": f1}
+
+    return {**counts, "before": metrics("before"), "after": metrics("after")}
+
+
 def run_matching(
     config: dict[str, Any], output_dir: str | Path, fresh_state: bool = False,
     diagnose_rules: bool = False,
@@ -1081,6 +1119,7 @@ def run_matching(
         )
         rules_trace_stats["seconds"] = time.perf_counter() - trace_started
     rules_enhancement_stats = None
+    second_pass_previous: dict[str, FinalDecision] = {}
     if bool(config.get("decision", {}).get("rules_enhanced_enabled", False)):
         from .rules_enhancement import enhance_rules_decisions
         enhanced_started = time.perf_counter()
@@ -1089,10 +1128,17 @@ def run_matching(
             [rules_by_id[record.adm_party_id] for record in matchable],
             graph, retriever, rules_scorer, config, party_job, default_job,
         )
+        second_pass_previous = rules_enhancement_stats.pop("_second_pass_previous", {})
         enhanced_by_id = {decision.adm_party_id: decision for decision in rules_decisions}
         rules_decisions = [enhanced_by_id.get(record.adm_party_id, rules_by_id[record.adm_party_id])
                            for record in records]
         rules_enhancement_stats["seconds"] = time.perf_counter() - enhanced_started
+    # Retain the exact pre-pass rules decisions in the same run. This allows a
+    # label-based comparison without changing ML decisions, events, or mappings.
+    rules_pre_second_pass = [second_pass_previous.get(item.adm_party_id, item) for item in rules_decisions]
+    second_pass_comparison = _compare_rules_second_pass(
+        prepared / "labels.jsonl", graph, rules_pre_second_pass, rules_decisions,
+    )
     events: list[dict[str, Any]] = []
     for update in graph_updates:
         root_id = graph.root_id(update["child_id"])
@@ -1138,7 +1184,10 @@ def run_matching(
     write_started = time.perf_counter()
     write_jsonl(output / "decisions.jsonl", (decision.to_dict() for decision in decisions))
     write_jsonl(output / "rules_decisions.jsonl", (decision.to_dict() for decision in rules_decisions))
+    write_jsonl(output / "rules_pre_second_pass_decisions.jsonl",
+                (decision.to_dict() for decision in rules_pre_second_pass))
     write_jsonl(output / "rules_baseline_decisions.jsonl", (decision.to_dict() for decision in baseline_rules_decisions))
+    write_json(output / "rules_second_pass_comparison.json", second_pass_comparison)
     write_jsonl(output / "events.jsonl", events)
     if new_mappings and not fresh_state:
         existing = list(read_jsonl(mapping_path)) if mapping_path.exists() else []
@@ -1168,6 +1217,8 @@ def run_matching(
         ),
         "rules_connector_short_name_enabled": bool(config.get("decision", {}).get("rules_connector_short_name_enabled", False)),
         "rules_multiword_prefix_enabled": bool(config.get("decision", {}).get("rules_multiword_prefix_enabled", False)),
+        "rules_second_pass_enabled": bool(config.get("decision", {}).get("rules_second_pass_enabled", False)),
+        "rules_second_pass_comparison": second_pass_comparison,
         "rules_connector_short_name_matches": sum(
             decision.decision == "MATCH" and decision.decision_tier in {
                 "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME", "RULES_ROOT_UNIQUE_CONNECTOR_PREFIX",

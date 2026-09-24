@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from .domain import LEGAL_SUFFIXES, FinalDecision, MatchProposal, PartyRecord, compact_name, normalize_name, parse_mentions
+from .domain import LEGAL_SUFFIXES, FinalDecision, MatchProposal, PartyRecord, base_name, compact_name, normalize_name, parse_mentions
 
 
 SEPARATOR = re.compile(r"-{2,}|\s+[-–—|/]\s*|\s*[-–—|/]\s+")
@@ -319,6 +319,142 @@ def _recover_core_anchors(
     return scored, accepted, blocked
 
 
+def _root_base_index(graph: Any) -> dict[str, set[str]]:
+    """Keep legal-suffix equivalence distinct from verified-root identity."""
+    roots: dict[str, set[str]] = defaultdict(set)
+    for party_id, node in graph.nodes.items():
+        base = base_name(node.party_name)
+        if base:
+            roots[base].add(graph.root_id(party_id))
+    return roots
+
+
+def _minor_spelling_variant(raw: str, official: str, idf: dict[str, float]) -> bool:
+    """One small token edit in an otherwise complete name; never a missing word."""
+    raw_tokens, official_tokens = base_name(raw).split(), base_name(official).split()
+    if len(raw_tokens) != len(official_tokens) or not raw_tokens:
+        return False
+    if len(raw_tokens) == 1 and min(len(raw_tokens[0]), len(official_tokens[0])) < 8:
+        return False
+    differences = [(left, right) for left, right in zip(raw_tokens, official_tokens) if left != right]
+    if len(differences) != 1:
+        return False
+    left, right = differences[0]
+    if min(len(left), len(right)) < 5 or _token_similarity(left, right) < 0.80:
+        return False
+    coverage = soft_token_coverage(raw, official, idf)
+    return min(coverage) >= 0.88
+
+
+def _second_pass_evidence(
+    record: PartyRecord, item: MatchProposal, proposals: list[MatchProposal],
+    root_tokens: dict[str, set[str]], root_prefixes: dict[str, set[str]],
+    root_bases: dict[str, set[str]], idf: dict[str, float],
+) -> tuple[int, str] | None:
+    """Structural evidence for one already-retrieved verified root, strongest first."""
+    if (item.candidate_type != "official" or item.candidate_collision_count != 1
+            or item.digit_conflict):
+        return None
+    raw = record.raw_name
+    anchored = _anchored_official_prefix(raw, item.matched_name)
+    if anchored is not None and item.rules_score >= 0.25:
+        _, remainder = anchored
+        if not _unsafe_anchor_remainder(remainder, item.root_party_id, proposals, idf):
+            return 4, "OFFICIAL_NAME_WITH_CONTEXT"
+    raw_base = base_name(raw)
+    official_base = base_name(item.matched_name)
+    if (raw_base and raw_base == official_base and normalize_name(raw) != normalize_name(item.matched_name)
+            and len(raw_base.replace(" ", "")) >= 8
+            and root_bases.get(raw_base) == {item.root_party_id}
+            and item.rules_score >= 0.55):
+        return 3, "LEGAL_SUFFIX_VARIANT"
+    if (not item.distinctive_token_conflict and item.rules_score >= 0.40
+            and _unique_official_short_name(raw, item, root_tokens, root_prefixes, 0.50)):
+        return 3, "DISTINCTIVE_SHORT_NAME"
+    if item.rules_score >= 0.35 and _minor_spelling_variant(raw, item.matched_name, idf):
+        return 2, "MINOR_SPELLING_VARIANT"
+    return None
+
+
+def _recover_second_pass(
+    records: list[PartyRecord], proposals_by_record: dict[str, list[MatchProposal]],
+    enhanced: dict[str, FinalDecision], graph: Any, scorer: Any,
+    party_job: dict[str, dict], default_job: dict,
+    root_tokens: dict[str, set[str]], root_prefixes: dict[str, set[str]],
+) -> tuple[dict[str, FinalDecision], dict[str, int]]:
+    """Revisit remaining plain NO_MATCH rows across retrieved roots only.
+
+    This is deliberately a separate, reversible rules stage. Labels and model
+    predictions are not read. Accepted matches retain the original rules score
+    rather than receiving an invented high confidence.
+    """
+    previous: dict[str, FinalDecision] = {}
+    counts: dict[str, int] = defaultdict(int)
+    root_bases = _root_base_index(graph)
+    for record in records:
+        old = enhanced[record.adm_party_id]
+        if old.decision != "NO_MATCH":
+            continue
+        mentions = parse_mentions(record)
+        if len(mentions) != 1 or mentions[0].parse_warning:
+            continue
+        proposals = proposals_by_record.get(record.adm_party_id, [])
+        if not proposals:
+            continue
+        counts["reviewed"] += 1
+        evidence: dict[str, tuple[int, MatchProposal, str]] = {}
+        for item in proposals:
+            found = _second_pass_evidence(
+                record, item, proposals, root_tokens, root_prefixes, root_bases, scorer.idf,
+            )
+            if found is None:
+                continue
+            strength, kind = found
+            current = evidence.get(item.root_party_id)
+            if current is None or (strength, item.rules_score) > (current[0], current[1].rules_score):
+                evidence[item.root_party_id] = (strength, item, kind)
+        if not evidence:
+            continue
+        ranked = sorted(evidence.values(), key=lambda entry: (-entry[0], -entry[1].rules_score, entry[1].root_party_id))
+        strength, winner, kind = ranked[0]
+        # A second plausible organization must not be silently displaced by a
+        # strong substring or typo. This includes an exact competing root.
+        if len(ranked) > 1 and ranked[1][0] >= strength - 1:
+            counts["ambiguous"] += 1
+            continue
+        if any(item.root_party_id != winner.root_party_id and item.exact for item in proposals):
+            counts["competing_exact"] += 1
+            continue
+        job = party_job.get(str(winner.owner_party_id), default_job)
+        if winner.rules_score < float(job.get("confidenceCutoff", 0.0)):
+            counts["request_cutoff"] += 1
+            continue
+        previous[record.adm_party_id] = old
+        enhanced[record.adm_party_id] = FinalDecision(
+            account_id=record.account_id, adm_party_id=record.adm_party_id, raw_name=record.raw_name,
+            decision="MATCH", confidence=winner.rules_score, reason="MATCH",
+            verified_party_id=winner.root_party_id, verified_party_name=winner.root_party_name,
+            matched_member_id=winner.owner_party_id, matched_member_name=winner.owner_party_name,
+            matched_candidate_name=winner.matched_name, matched_candidate_type=winner.candidate_type,
+            candidate_expansion_confidence=winner.candidate_confidence, matched_mention=winner.mention_text,
+            match_method=f"rules:second_pass_{kind.lower()}", decision_tier=f"RULES_SECOND_PASS_{kind}",
+            retrieval_sources=winner.retrieval_sources, identity_score=winner.rules_score,
+            char_tfidf_score=winner.char_tfidf_score, word_tfidf_score=winner.word_tfidf_score,
+            rrf_score=winner.rrf_score, char_similarity=winner.char_similarity,
+            jaro_winkler=winner.jaro_winkler, levenshtein=winner.levenshtein,
+            token_jaccard=winner.token_jaccard, raw_coverage=winner.raw_coverage,
+            candidate_coverage=winner.candidate_coverage,
+            distinctive_token_conflict=winner.distinctive_token_conflict, digit_conflict=winner.digit_conflict,
+            graph_path=graph.path_to_root(winner.owner_party_id), retrieved_root_ids=old.retrieved_root_ids,
+            runner_up_party_id=ranked[1][1].root_party_id if len(ranked) > 1 else None,
+            runner_up_score=ranked[1][1].rules_score if len(ranked) > 1 else None,
+            margin=winner.rules_score - ranked[1][1].rules_score if len(ranked) > 1 else old.margin,
+        )
+        counts["matches"] += 1
+        counts[kind.lower()] += 1
+    return previous, dict(counts)
+
+
 def enhance_rules_decisions(
     records: list[PartyRecord], proposals_by_record: dict[str, list[MatchProposal]],
     baseline_decisions: list[FinalDecision], graph: Any, retriever: Any,
@@ -433,9 +569,17 @@ def enhance_rules_decisions(
     core_scored, core_matches, core_blocked = _recover_core_anchors(
         records, proposals_by_record, enhanced, graph, retriever, scorer, config, party_job, default_job,
     )
+    second_previous: dict[str, FinalDecision] = {}
+    second_stats: dict[str, int] = {}
+    if bool(config.get("decision", {}).get("rules_second_pass_enabled", False)):
+        second_previous, second_stats = _recover_second_pass(
+            records, proposals_by_record, enhanced, graph, scorer, party_job, default_job,
+            root_tokens, root_prefixes,
+        )
     result = [enhanced[item.adm_party_id] for item in records]
     return result, {"reviewed_plain_no_matches": reviewed, "view_candidates_scored": view_candidates,
                     "unsafe_views_skipped": unsafe_views, "short_name_matches": short_matches,
                     "multiword_short_name_matches": multiword_short_matches,
                     "safe_view_matches": view_matches, "core_anchor_candidates_scored": core_scored,
-                    "core_anchor_matches": core_matches, "unsafe_core_anchors_skipped": core_blocked}
+                    "core_anchor_matches": core_matches, "unsafe_core_anchors_skipped": core_blocked,
+                    "second_pass": second_stats, "_second_pass_previous": second_previous}
