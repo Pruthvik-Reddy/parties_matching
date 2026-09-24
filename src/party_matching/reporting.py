@@ -365,8 +365,8 @@ def _write_workbook(
     grouped.set_tab_color("#1F4E78")
     grouped.freeze_panes(1, 1)
     grouped.write_row(0, 0, [
-        "Verified Party", "Number in dataset", "Unverified Parties",
-        "Number of unverified parties matched", "Number of correct predictions",
+        "Verified Party", "Number in dataset", "Number of unverified parties matched",
+        "Number of correct predictions", "Unverified Parties",
         "Unverified Parties - Ground truth",
     ], header)
     raw_name_column = manifest.get("raw_name_column")
@@ -392,19 +392,18 @@ def _write_workbook(
             if part == 0:
                 grouped.write_string(row_number, 0, str(group["name"]), text)
                 grouped.write_number(row_number, 1, len(group["truth"]), integer)
-                grouped.write_number(row_number, 3, len(group["matched"]), integer)
-                grouped.write_number(row_number, 4, group["correct"], integer)
+                grouped.write_number(row_number, 2, len(group["matched"]), integer)
+                grouped.write_number(row_number, 3, group["correct"], integer)
             if part < len(matched_chunks):
-                grouped.write_string(row_number, 2, matched_chunks[part], text)
+                grouped.write_string(row_number, 4, matched_chunks[part], text)
             if part < len(truth_chunks):
                 grouped.write_string(row_number, 5, truth_chunks[part], text)
             row_number += 1
     grouped.set_row(0, 38)
     grouped.set_column("A:A", 48)
     grouped.set_column("B:B", 16)
-    grouped.set_column("C:C", 110)
-    grouped.set_column("D:E", 24)
-    grouped.set_column("F:F", 110)
+    grouped.set_column("C:D", 24)
+    grouped.set_column("E:F", 110)
     if row_number > 1:
         grouped.autofilter(0, 0, row_number - 1, 5)
 
@@ -586,14 +585,18 @@ def _write_workbook(
     for column, width in enumerate((48, 48, 48, 18, 48)):
         detail.set_column(column, column, width)
     match_format = workbook.add_format({"bg_color": "#E2F0D9", "font_color": "#275D38"})
-    no_match_format = workbook.add_format({"bg_color": "#FCE8E6", "font_color": "#9C2F24"})
+    no_match_format = workbook.add_format({"bg_color": "#FFF2CC", "font_color": "#7F6000"})
+    wrong_match_format = workbook.add_format({"bg_color": "#FCE8E6", "font_color": "#9C2F24"})
     unscored_format = workbook.add_format({"bg_color": "#F2F4F7", "font_color": "#4B5563"})
     if rows:
         detail.conditional_format(1, 0, len(rows), 4, {
             "type": "formula", "criteria": '=$D2="Correct"', "format": match_format,
         })
         detail.conditional_format(1, 0, len(rows), 4, {
-            "type": "formula", "criteria": '=OR($D2="Wrong match",$D2="No match")', "format": no_match_format,
+            "type": "formula", "criteria": '=$D2="No match"', "format": no_match_format,
+        })
+        detail.conditional_format(1, 0, len(rows), 4, {
+            "type": "formula", "criteria": '=$D2="Wrong match"', "format": wrong_match_format,
         })
         detail.conditional_format(1, 0, len(rows), 4, {
             "type": "formula", "criteria": '=$D2="Not scored"', "format": unscored_format,
