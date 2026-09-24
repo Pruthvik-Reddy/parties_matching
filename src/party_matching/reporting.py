@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import math
 import re
 from collections import Counter, defaultdict
@@ -21,6 +22,8 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
     decisions = {row["adm_party_id"]: row for row in read_jsonl(output / "decisions.jsonl")}
     rules_path = output / "rules_decisions.jsonl"
     rules_decisions = {row["adm_party_id"]: row for row in read_jsonl(rules_path)} if rules_path.exists() else {}
+    prior_rules_path = output / "rules_baseline_decisions.jsonl"
+    prior_rules_decisions = {row["adm_party_id"]: row for row in read_jsonl(prior_rules_path)} if prior_rules_path.exists() else {}
     source_rows = list(read_jsonl(prepared / "source_rows.jsonl"))
     graph_path = run_stats.get("graph_path")
     graph_payload = (read_json(graph_path, {}) or {}) if graph_path else {}
@@ -45,6 +48,7 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
         label = labels[adm_id]
         decision = decisions[adm_id]
         rules_decision = rules_decisions.get(adm_id, {})
+        prior_rules_decision = prior_rules_decisions.get(adm_id, {})
         rules_match = rules_decision.get("decision") == "MATCH"
         workbook_canonical_id = label.get("expected_party_id")
         expected, expected_parent_name = global_parent(workbook_canonical_id)
@@ -88,6 +92,8 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
             "Rules-only Verified ID": rules_decision.get("verified_party_id") if rules_match else None,
             "Rules-only prediction": rules_decision.get("verified_party_name") if rules_match else ("NO_MATCH" if rules_decision else None),
             "Rules-only Decision Tier": rules_decision.get("decision_tier"),
+            "Prior Rules Verified ID": prior_rules_decision.get("verified_party_id") if prior_rules_decision.get("decision") == "MATCH" else None,
+            "Prior Rules Decision Tier": prior_rules_decision.get("decision_tier"),
             "Top Candidate Verified ID": candidate_id,
             "Top Candidate Verified Name": candidate_name,
             "Matched Member ID": decision.get("matched_member_id"),
@@ -147,6 +153,8 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
         prediction["Error Bucket"] = _error_bucket(prediction)
         prediction["Case Types"] = _join(_case_types(raw_name, prediction))
         detail_rows.append({"source": source_row["source"], "prediction": prediction})
+    _write_rules_changes(output / "rules_changes.csv", detail_rows, manifest,
+                         prior_rules_decisions, rules_decisions)
     metrics = _metrics(detail_rows, run_stats)
     write_json(output / "run_metrics.json", metrics)
     write_json(output / "diagnostics.json", {
@@ -160,6 +168,40 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
     _write_analysis(output / "analysis.md", metrics, run_stats)
     _write_workbook(output / "predictions.xlsx", detail_rows, manifest, metrics, run_stats)
     return metrics
+
+
+def _write_rules_changes(
+    path: Path, detail_rows: list[dict[str, Any]], manifest: dict[str, Any],
+    prior: dict[str, dict[str, Any]], enhanced: dict[str, dict[str, Any]],
+) -> None:
+    """Small, label-aware audit only; matching itself never consumes labels."""
+    columns = ["Split", "Unverified Party", "Verified Party - Label", "Previous rules",
+               "Enhanced rules", "Enhanced result", "Enhanced decision tier"]
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        for row in detail_rows:
+            prediction = row["prediction"]
+            adm_id = prediction["ADM Party ID"]
+            old, new = prior.get(adm_id), enhanced.get(adm_id)
+            if not old or not new:
+                continue
+            old_target = old.get("verified_party_id") if old.get("decision") == "MATCH" else None
+            new_target = new.get("verified_party_id") if new.get("decision") == "MATCH" else None
+            if old_target == new_target:
+                continue
+            expected = prediction.get("Expected Verified ID")
+            result = ("UNSCORED" if not prediction.get("Scorable") else
+                      "NO_MATCH" if new_target is None else
+                      "CORRECT" if new_target == expected else "WRONG")
+            writer.writerow([
+                prediction["Dataset Split"],
+                row["source"].get(manifest.get("raw_name_column")) or "",
+                prediction.get("Expected Canonical Name") or "",
+                old.get("verified_party_name") if old_target else "NO_MATCH",
+                new.get("verified_party_name") if new_target else "NO_MATCH",
+                result, new.get("decision_tier") or "",
+            ])
 
 
 def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> dict[str, Any]:
@@ -286,10 +328,17 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
     )
     rules_precision = rules_correct / len(rules_matches) if rules_matches else None
     rules_recall = rules_correct / len(held_out) if held_out else None
-    baseline_matches = [row for row in rules_matches
-                        if row["prediction"].get("Rules-only Decision Tier") != "RULES_UNIQUE_CONTAINMENT"]
+    prior_rules_matches = [row for row in held_out if row["prediction"].get("Prior Rules Verified ID")]
+    prior_rules_correct = sum(
+        row["prediction"]["Prior Rules Verified ID"] == row["prediction"]["Expected Verified ID"]
+        for row in prior_rules_matches
+    )
+    prior_rules_precision = prior_rules_correct / len(prior_rules_matches) if prior_rules_matches else None
+    prior_rules_recall = prior_rules_correct / len(held_out) if held_out else None
+    baseline_matches = [row for row in prior_rules_matches
+                        if row["prediction"].get("Prior Rules Decision Tier") != "RULES_UNIQUE_CONTAINMENT"]
     baseline_correct = sum(
-        row["prediction"]["Rules-only Verified ID"] == row["prediction"]["Expected Verified ID"]
+        row["prediction"]["Prior Rules Verified ID"] == row["prediction"]["Expected Verified ID"]
         for row in baseline_matches
     )
     baseline_precision = baseline_correct / len(baseline_matches) if baseline_matches else None
@@ -315,6 +364,13 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
                 row["prediction"].get("Predicted Verified ID") != row["prediction"].get("Rules-only Verified ID")
                 for row in held_out
             ),
+            "prior_rules": {
+                "matches": len(prior_rules_matches), "correct_matches": prior_rules_correct,
+                "precision": prior_rules_precision, "recall": prior_rules_recall,
+                "f1": 2 * prior_rules_precision * prior_rules_recall / (prior_rules_precision + prior_rules_recall)
+                if prior_rules_precision is not None and prior_rules_recall is not None
+                and prior_rules_precision + prior_rules_recall else None,
+            },
             "containment": {
                 "calibration": containment_summary([
                     row for row in detail_rows if row["prediction"]["Dataset Split"] == "CALIBRATION"
@@ -451,8 +507,9 @@ def _write_workbook(
     overall = metrics["overall"]
     for row_number, name, values in (
         (5, "ML", overall),
-        (6, "Rules only + containment", metrics["rules_only"]),
-        (7, "Rules only baseline", metrics["rules_only"]["baseline_without_containment"]),
+        (6, "Rules only - enhanced", metrics["rules_only"]),
+        (7, "Rules only - previous", metrics["rules_only"]["prior_rules"]),
+        (8, "Rules only - no containment", metrics["rules_only"]["baseline_without_containment"]),
     ):
         summary.write_string(row_number, 3, name, text)
         summary.write_number(row_number, 4, values["matches"], integer)
@@ -486,6 +543,9 @@ def _write_workbook(
         ("Effective cutoff", run_stats.get("effective_cutoff"), decimal),
         ("Rules-only connector cutoff", run_stats.get("rules_system_threshold"), decimal),
         ("Rules-only plain cutoff", run_stats.get("rules_plain_threshold", run_stats.get("rules_system_threshold")), decimal),
+        ("Enhanced rules enabled", "yes" if run_stats.get("rules_enhanced_enabled") else "no", text),
+        ("Enhanced rules short-name matches", (run_stats.get("rules_enhancement") or {}).get("short_name_matches"), integer),
+        ("Enhanced rules safe-view matches", (run_stats.get("rules_enhancement") or {}).get("safe_view_matches"), integer),
         ("Rules containment enabled", "yes" if run_stats.get("rules_containment_enabled") else "no", text),
         ("Rules-only containment floor", run_stats.get("rules_containment_min_confidence"), decimal),
         ("Rules containment calibration matches", metrics["rules_only"]["containment"]["calibration"]["matches"], integer),
@@ -502,6 +562,7 @@ def _write_workbook(
         "word_matrix_seconds", "shortlist_seconds", "proposal_build_seconds",
         "identity_feature_seconds", "identity_model_seconds", "decision_seconds",
         "rules_decision_seconds",
+        "rules_enhancement_seconds",
         "write_seconds", "peak_rss_mb",
     )
     for offset in range(max(len(summary_values), len(profile_keys))):

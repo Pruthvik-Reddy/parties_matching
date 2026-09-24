@@ -851,7 +851,7 @@ def decide_records(
 
 def run_matching(
     config: dict[str, Any], output_dir: str | Path, fresh_state: bool = False,
-    diagnose_rules: bool = False, shadow_name_views: bool = False,
+    diagnose_rules: bool = False,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     paths = config.get("paths", {})
@@ -997,6 +997,7 @@ def run_matching(
             decision.decision = "NO_MATCH"
             decision.reason = "BELOW_REQUEST_CUTOFF"
     rules_decision_seconds = time.perf_counter() - rules_started
+    baseline_rules_decisions = rules_decisions
     # TEMPORARY DIAGNOSTIC HOOK: remove with diagnostics.py and --diagnose-rules
     # after rules behavior is settled. It only reads already-scored proposals and
     # writes a sidecar; no decision, graph, mapping, or event is changed here.
@@ -1010,6 +1011,19 @@ def run_matching(
             prepared / "labels.jsonl", graph, rules_scorer, config,
         )
         rules_trace_stats["seconds"] = time.perf_counter() - trace_started
+    rules_enhancement_stats = None
+    if bool(config.get("decision", {}).get("rules_enhanced_enabled", False)):
+        from .rules_enhancement import enhance_rules_decisions
+        enhanced_started = time.perf_counter()
+        rules_decisions, rules_enhancement_stats = enhance_rules_decisions(
+            matchable, proposals,
+            [rules_by_id[record.adm_party_id] for record in matchable],
+            graph, retriever, rules_scorer, config, party_job, default_job,
+        )
+        enhanced_by_id = {decision.adm_party_id: decision for decision in rules_decisions}
+        rules_decisions = [enhanced_by_id.get(record.adm_party_id, rules_by_id[record.adm_party_id])
+                           for record in records]
+        rules_enhancement_stats["seconds"] = time.perf_counter() - enhanced_started
     events: list[dict[str, Any]] = []
     for update in graph_updates:
         root_id = graph.root_id(update["child_id"])
@@ -1055,31 +1069,12 @@ def run_matching(
     write_started = time.perf_counter()
     write_jsonl(output / "decisions.jsonl", (decision.to_dict() for decision in decisions))
     write_jsonl(output / "rules_decisions.jsonl", (decision.to_dict() for decision in rules_decisions))
+    write_jsonl(output / "rules_baseline_decisions.jsonl", (decision.to_dict() for decision in baseline_rules_decisions))
     write_jsonl(output / "events.jsonl", events)
     if new_mappings and not fresh_state:
         existing = list(read_jsonl(mapping_path)) if mapping_path.exists() else []
         write_jsonl(mapping_path, [*existing, *new_mappings])
     write_seconds = time.perf_counter() - write_started
-    # TEMPORARY SHADOW EXPERIMENT: run only after production decisions/events
-    # have been written. Remove this hook, its CLI flag, and shadow_name_views.py
-    # after selecting a design. Shadow failures do not affect normal outputs.
-    shadow_stats = None
-    if shadow_name_views:
-        import traceback
-        from .shadow_name_views import run_shadow_name_views
-        shadow_started = time.perf_counter()
-        try:
-            shadow_stats = run_shadow_name_views(
-                output, prepared / "labels.jsonl", matchable, proposals,
-                {decision.adm_party_id: decision for decision in rules_decisions},
-                graph, retriever, rules_scorer, config, party_job, jobs,
-            )
-        except Exception as exc:
-            error_path = output / "shadow_name_views_error.txt"
-            error_path.write_text(traceback.format_exc(), encoding="utf-8")
-            shadow_stats = {"error": str(exc), "error_path": str(error_path)}
-            print(f"Shadow name-view experiment failed; normal outputs are intact: {exc}")
-        shadow_stats["seconds"] = time.perf_counter() - shadow_started
     stats = {
         "account_id": account_id,
         "records": len(records),
@@ -1119,8 +1114,10 @@ def run_matching(
         "index_rss_mb": index_rss_mb,
         "decision_seconds": decision_seconds,
         "rules_decision_seconds": rules_decision_seconds,
+        "rules_enhanced_enabled": bool(config.get("decision", {}).get("rules_enhanced_enabled", False)),
+        "rules_enhancement_seconds": (rules_enhancement_stats or {}).get("seconds"),
+        **({"rules_enhancement": rules_enhancement_stats} if rules_enhancement_stats is not None else {}),
         **({"rules_diagnostic_trace": rules_trace_stats} if rules_trace_stats is not None else {}),
-        **({"shadow_name_views": shadow_stats} if shadow_stats is not None else {}),
         "decision_rss_mb": decision_rss_mb,
         "write_seconds": write_seconds,
         "peak_rss_mb": max((value for value in (

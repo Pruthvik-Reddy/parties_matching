@@ -62,10 +62,11 @@ Add `--cross-encoder` to training only after the feature baseline works. Set `[e
 Each run writes:
 
 - `events.jsonl`: API-shaped accepted mapping events.
-- `decisions.jsonl`: every ML-path decision and its evidence; `rules_decisions.jsonl` holds the comparison decisions and never emits events.
+- `decisions.jsonl`: every ML-path decision and its evidence; `rules_decisions.jsonl` holds enhanced rules comparison decisions, and `rules_baseline_decisions.jsonl` preserves the previous rules decisions. Neither rules file emits events.
 - `predictions.xlsx`: `Summary` compares ML predictions and ground truth by verified root; `Stats` compares held-out ML and rules-only precision/recall/F1; `Detail` has every cleaned unverified row in five columns, including a rules-only prediction.
 - `data/prepared/cleaning_report.json` and `excluded_rows.jsonl`: counts and source-row references for exact duplicates, verified self-rows, and conflicting labels set aside during preparation.
 - `run_metrics.json`: full held-out, split, case and confidence metrics.
+- `rules_changes.csv`: only rows where the enhanced rules prediction differs from the previous rules prediction, with the label and correctness for review.
 - `diagnostics.json`: compact retrieval funnel, connector cohorts and error buckets.
 - `run_stats.json` and `analysis.md`.
 
@@ -82,15 +83,9 @@ PYTHONPATH=src python scripts/analyze_candidates.py --run outputs/rules_diagnost
 
 `rules_candidate_trace.jsonl` captures missed labeled **plain-name** rows, including the expected root's final rules rank/score/guard and the top five candidates. `rules_diagnostics.md` gives calibration/test failure counts and examples; `rules_diagnostics.csv` supports row-level review. OBO/VIA and unknown-label rows are intentionally outside this first audit. These files contain party names and stay local with the other confidential outputs. The flag is off by default and does not alter match decisions or events. The hook and module are marked `TEMPORARY DIAGNOSTIC` for removal after the rules investigation.
 
-## Temporary name-view experiment
+## Enhanced rules-only comparison
 
-The opt-in shadow experiment runs four rules-only arms in one pass: current baseline, alternate-name retrieval only, alternate-name scoring only, and both together. It changes **no** normal ML/rules decisions, events, graph updates, or prediction workbook. It compares labeled plain-name rows only; OBO/VIA decisions are carried forward unchanged in the overall held-out projection. It can add substantial runtime and memory use, so run it only for an evaluation batch.
-
-```bash
-PYTHONPATH=src python scripts/run.py --mode parallel --fresh-state --shadow-name-views --output outputs/name_views_exp
-```
-
-Review `shadow_name_views.md` for calibration and held-out metrics, `shadow_name_views_changes.csv` for changed rows, and `shadow_name_views.json` for counts and limitations. The views are generic name interpretations (delimited segments, trailing parentheses, spacing, and plural variants), **not** inferred legal aliases. A suffix may refer to another company, so the experiment does not automatically promote a winning arm. This module, CLI flag, and matching hook are marked `TEMPORARY SHADOW EXPERIMENT` for cleanup after evaluation. If the shadow work fails, the normal outputs remain available and `shadow_name_views_error.txt` records the error.
+The rules path first calculates its previous decision. With `decision.rules_enhanced_enabled = true`, only rejected plain-name rows are reconsidered using guarded name views, a two-way soft-token comparison, and a verified-root-unique short-name rule. It reuses the roots retrieved for the original full name; no new root or company-specific alias is inserted. Previously accepted rules decisions, OBO/VIA decisions, trained ML decisions, and emitted events are unchanged. The Stats sheet compares enhanced and previous rules results from the same run; `rules_changes.csv` lists changed rows. `rules_baseline_decisions.jsonl` preserves the previous rules decisions, while `rules_decisions.jsonl` contains the enhanced results. Set `rules_enhanced_enabled = false` to restore the previous rules output. This code-only change does not require retraining; rerun `scripts/run.py` against the existing prepared data and model artifact.
 
 ## Important semantics
 
@@ -107,7 +102,7 @@ Review `shadow_name_views.md` for calibration and held-out metrics, `shadow_name
 - OBO/VIA, no-OBO, no-VIA and plain-name cohorts are reported separately.
 - `UNKNOWN` rows appear in predictions but not supervised metrics.
 - Preparation uses exact raw-name and canonical-label text for duplicate and conflict checks; it does not normalize these labels or infer a merge from name similarity. An exact raw-name = canonical-name row is treated as a verified self-row, retained in the catalog but excluded from unverified matching and evaluation. Duplicate raw+label pairs collapse to their first row. Raw names carrying two distinct known labels are set aside for review. The source workbook stays unchanged.
-- Detail shows unverified name, ML match (or `NO_MATCH`), graph-root label, ML result, and rules-only prediction. Whole-row shading marks correct matches green, no match yellow, wrong matches red, and unscored rows gray. Rules-only uses the same retrieved candidates and guards, but no trained identity/target model, calibration, or cross-encoder; it gets a separate cutoff selected on calibration data. Summary and events remain ML-based. IDs and scoring evidence remain in the JSONL files, not Excel. Summary includes unknown-label predictions but does not count them as correct; long alias lists spill into continuation rows without repeating counts. `run_stats.json` and `analysis.md` include stage timings and process-memory snapshots; `end_to_end_seconds` includes workbook generation.
+- Detail shows unverified name, ML match (or `NO_MATCH`), graph-root label, ML result, and rules-only prediction. Whole-row shading marks correct matches green, no match yellow, wrong matches red, and unscored rows gray. Rules-only has no trained identity/target model, calibration, or cross-encoder; its enhanced path is isolated from ML and keeps a separate cutoff. Summary and events remain ML-based. IDs and scoring evidence remain in the JSONL files, not Excel. Summary includes unknown-label predictions but does not count them as correct; long alias lists spill into continuation rows without repeating counts. `run_stats.json` and `analysis.md` include stage timings and process-memory snapshots; `end_to_end_seconds` includes workbook generation.
 - The rules-only short-name containment experiment and the preserved blanket-cutoff option are documented in [EXPERIMENTS.md](EXPERIMENTS.md). Stats shows the rules-only result and its no-containment baseline from the same run. Disable the rule with `rules_containment_enabled = false`; `rules_plain_threshold` remains independently adjustable.
 - Rows that already have a verified parent remain in predictions, but are excluded from matching, training, and supervised metrics.
 - Normal matching never reads `labels.jsonl`; only reporting and training do. The opt-in temporary diagnostic trace reads held-out labels solely to record missed candidates, never to choose matches.

@@ -68,6 +68,7 @@ fallback_system_threshold = 0.90
 minimum_calibration_matches = 100
 calibration_method = "isotonic" # isotonic | none
 rules_plain_threshold = 0.80 # rules-only comparison, plain names only; ML and OBO/VIA unchanged
+rules_enhanced_enabled = true # guarded views + root-unique short names, rules-only; false restores previous behavior
 rules_containment_enabled = true # set false to compare against the plain-cutoff baseline
 rules_containment_min_confidence = 0.40
 rules_containment_min_margin = 0.08

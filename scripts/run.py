@@ -20,8 +20,6 @@ def main() -> None:
     parser.add_argument("--fresh-state", action="store_true", help="Use isolated state for a reproducible evaluation run.")
     # TEMPORARY DIAGNOSTIC: remove together with the hook in run_matching.
     parser.add_argument("--diagnose-rules", action="store_true", help="Write an opt-in, read-only candidate trace for missed labeled plain-name rules decisions.")
-    # TEMPORARY SHADOW EXPERIMENT: remove with the hook and experiment module.
-    parser.add_argument("--shadow-name-views", action="store_true", help="Compare four rules-only name-view arms without changing emitted matches.")
     args = parser.parse_args()
     config = load_config(args.config)
     native_threads = str(config.get("execution", {}).get("native_threads", 10))
@@ -39,7 +37,7 @@ def main() -> None:
     output = Path(args.output or Path(config.get("paths", {}).get("outputs_dir", "outputs")) / run_id)
     stats = run_matching(
         config, output, fresh_state=args.fresh_state,
-        diagnose_rules=args.diagnose_rules, shadow_name_views=args.shadow_name_views,
+        diagnose_rules=args.diagnose_rules,
     )
     report_started = time.perf_counter()
     metrics = build_reports(config.get("paths", {}).get("prepared_dir", "data/prepared"), output, stats)
