@@ -71,6 +71,17 @@ Each run writes:
 
 Evaluation should use `--fresh-state`. Incremental runs omit that flag and reuse `state/<account>/graph.json` plus `mappings.jsonl`.
 
+## Temporary rules diagnosis
+
+For the rules-only recall investigation, opt in to a sidecar candidate trace, then summarize it separately:
+
+```bash
+PYTHONPATH=src python scripts/run.py --mode parallel --fresh-state --diagnose-rules --output outputs/rules_diagnostic
+PYTHONPATH=src python scripts/analyze_candidates.py --run outputs/rules_diagnostic
+```
+
+`rules_candidate_trace.jsonl` captures missed labeled **plain-name** rows, including the expected root's final rules rank/score/guard and the top five candidates. `rules_diagnostics.md` gives calibration/test failure counts and examples; `rules_diagnostics.csv` supports row-level review. OBO/VIA and unknown-label rows are intentionally outside this first audit. These files contain party names and stay local with the other confidential outputs. The flag is off by default and does not alter match decisions or events. The hook and module are marked `TEMPORARY DIAGNOSTIC` for removal after the rules investigation.
+
 ## Important semantics
 
 - Only verified parties are graph nodes.
@@ -89,5 +100,5 @@ Evaluation should use `--fresh-state`. Incremental runs omit that flag and reuse
 - Detail shows unverified name, ML match (or `NO_MATCH`), graph-root label, ML result, and rules-only prediction. Whole-row shading marks correct matches green, no match yellow, wrong matches red, and unscored rows gray. Rules-only uses the same retrieved candidates and guards, but no trained identity/target model, calibration, or cross-encoder; it gets a separate cutoff selected on calibration data. Summary and events remain ML-based. IDs and scoring evidence remain in the JSONL files, not Excel. Summary includes unknown-label predictions but does not count them as correct; long alias lists spill into continuation rows without repeating counts. `run_stats.json` and `analysis.md` include stage timings and process-memory snapshots; `end_to_end_seconds` includes workbook generation.
 - The rules-only short-name containment experiment and the preserved blanket-cutoff option are documented in [EXPERIMENTS.md](EXPERIMENTS.md). Stats shows the rules-only result and its no-containment baseline from the same run. Disable the rule with `rules_containment_enabled = false`; `rules_plain_threshold` remains independently adjustable.
 - Rows that already have a verified parent remain in predictions, but are excluded from matching, training, and supervised metrics.
-- The matcher never reads `labels.jsonl`; only reporting and training do.
+- Normal matching never reads `labels.jsonl`; only reporting and training do. The opt-in temporary diagnostic trace reads held-out labels solely to record missed candidates, never to choose matches.
 - A matcher artifact is rejected when it was trained against a different prepared workbook.

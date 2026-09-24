@@ -849,7 +849,10 @@ def decide_records(
     return [by_id[record.adm_party_id] for record in records]
 
 
-def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bool = False) -> dict[str, Any]:
+def run_matching(
+    config: dict[str, Any], output_dir: str | Path, fresh_state: bool = False,
+    diagnose_rules: bool = False,
+) -> dict[str, Any]:
     started = time.perf_counter()
     paths = config.get("paths", {})
     prepared = Path(paths.get("prepared_dir", "data/prepared"))
@@ -994,6 +997,19 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
             decision.decision = "NO_MATCH"
             decision.reason = "BELOW_REQUEST_CUTOFF"
     rules_decision_seconds = time.perf_counter() - rules_started
+    # TEMPORARY DIAGNOSTIC HOOK: remove with diagnostics.py and --diagnose-rules
+    # after rules behavior is settled. It only reads already-scored proposals and
+    # writes a sidecar; no decision, graph, mapping, or event is changed here.
+    rules_trace_stats = None
+    if diagnose_rules:
+        from .diagnostics import write_rules_candidate_trace
+        trace_started = time.perf_counter()
+        rules_trace_stats = write_rules_candidate_trace(
+            output / "rules_candidate_trace.jsonl", matchable, proposals,
+            {decision.adm_party_id: decision for decision in rules_decisions},
+            prepared / "labels.jsonl", graph, rules_scorer, config,
+        )
+        rules_trace_stats["seconds"] = time.perf_counter() - trace_started
 
     events: list[dict[str, Any]] = []
     for update in graph_updates:
@@ -1084,6 +1100,7 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
         "index_rss_mb": index_rss_mb,
         "decision_seconds": decision_seconds,
         "rules_decision_seconds": rules_decision_seconds,
+        **({"rules_diagnostic_trace": rules_trace_stats} if rules_trace_stats is not None else {}),
         "decision_rss_mb": decision_rss_mb,
         "write_seconds": write_seconds,
         "peak_rss_mb": max((value for value in (
