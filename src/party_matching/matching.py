@@ -851,7 +851,7 @@ def decide_records(
 
 def run_matching(
     config: dict[str, Any], output_dir: str | Path, fresh_state: bool = False,
-    diagnose_rules: bool = False,
+    diagnose_rules: bool = False, shadow_name_views: bool = False,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     paths = config.get("paths", {})
@@ -1010,7 +1010,6 @@ def run_matching(
             prepared / "labels.jsonl", graph, rules_scorer, config,
         )
         rules_trace_stats["seconds"] = time.perf_counter() - trace_started
-
     events: list[dict[str, Any]] = []
     for update in graph_updates:
         root_id = graph.root_id(update["child_id"])
@@ -1061,6 +1060,26 @@ def run_matching(
         existing = list(read_jsonl(mapping_path)) if mapping_path.exists() else []
         write_jsonl(mapping_path, [*existing, *new_mappings])
     write_seconds = time.perf_counter() - write_started
+    # TEMPORARY SHADOW EXPERIMENT: run only after production decisions/events
+    # have been written. Remove this hook, its CLI flag, and shadow_name_views.py
+    # after selecting a design. Shadow failures do not affect normal outputs.
+    shadow_stats = None
+    if shadow_name_views:
+        import traceback
+        from .shadow_name_views import run_shadow_name_views
+        shadow_started = time.perf_counter()
+        try:
+            shadow_stats = run_shadow_name_views(
+                output, prepared / "labels.jsonl", matchable, proposals,
+                {decision.adm_party_id: decision for decision in rules_decisions},
+                graph, retriever, rules_scorer, config, party_job, jobs,
+            )
+        except Exception as exc:
+            error_path = output / "shadow_name_views_error.txt"
+            error_path.write_text(traceback.format_exc(), encoding="utf-8")
+            shadow_stats = {"error": str(exc), "error_path": str(error_path)}
+            print(f"Shadow name-view experiment failed; normal outputs are intact: {exc}")
+        shadow_stats["seconds"] = time.perf_counter() - shadow_started
     stats = {
         "account_id": account_id,
         "records": len(records),
@@ -1101,6 +1120,7 @@ def run_matching(
         "decision_seconds": decision_seconds,
         "rules_decision_seconds": rules_decision_seconds,
         **({"rules_diagnostic_trace": rules_trace_stats} if rules_trace_stats is not None else {}),
+        **({"shadow_name_views": shadow_stats} if shadow_stats is not None else {}),
         "decision_rss_mb": decision_rss_mb,
         "write_seconds": write_seconds,
         "peak_rss_mb": max((value for value in (

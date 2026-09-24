@@ -82,6 +82,16 @@ PYTHONPATH=src python scripts/analyze_candidates.py --run outputs/rules_diagnost
 
 `rules_candidate_trace.jsonl` captures missed labeled **plain-name** rows, including the expected root's final rules rank/score/guard and the top five candidates. `rules_diagnostics.md` gives calibration/test failure counts and examples; `rules_diagnostics.csv` supports row-level review. OBO/VIA and unknown-label rows are intentionally outside this first audit. These files contain party names and stay local with the other confidential outputs. The flag is off by default and does not alter match decisions or events. The hook and module are marked `TEMPORARY DIAGNOSTIC` for removal after the rules investigation.
 
+## Temporary name-view experiment
+
+The opt-in shadow experiment runs four rules-only arms in one pass: current baseline, alternate-name retrieval only, alternate-name scoring only, and both together. It changes **no** normal ML/rules decisions, events, graph updates, or prediction workbook. It compares labeled plain-name rows only; OBO/VIA decisions are carried forward unchanged in the overall held-out projection. It can add substantial runtime and memory use, so run it only for an evaluation batch.
+
+```bash
+PYTHONPATH=src python scripts/run.py --mode parallel --fresh-state --shadow-name-views --output outputs/name_views_exp
+```
+
+Review `shadow_name_views.md` for calibration and held-out metrics, `shadow_name_views_changes.csv` for changed rows, and `shadow_name_views.json` for counts and limitations. The views are generic name interpretations (delimited segments, trailing parentheses, spacing, and plural variants), **not** inferred legal aliases. A suffix may refer to another company, so the experiment does not automatically promote a winning arm. This module, CLI flag, and matching hook are marked `TEMPORARY SHADOW EXPERIMENT` for cleanup after evaluation. If the shadow work fails, the normal outputs remain available and `shadow_name_views_error.txt` records the error.
+
 ## Important semantics
 
 - Only verified parties are graph nodes.
