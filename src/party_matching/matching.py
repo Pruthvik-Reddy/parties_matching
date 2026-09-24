@@ -780,7 +780,7 @@ def _decide_connectors(
                 best_rejected = (confidence, proposal)
         retrieved_roots = [root for root, _ in sorted(retrieved.items(), key=lambda item: (-item[1], item[0]))]
         connector = context["connector"]
-        preferred_index = 0 if connector == "OBO" else len(mention_results) - 1
+        preferred_index = len(mention_results) - 1 if connector == "OBO" else 0
         preferred = mention_results[preferred_index]
         band = max(0.0, float(matching_cfg.get("preferred_near_cutoff_band", 0.03)))
         if (
@@ -811,8 +811,8 @@ def _decide_connectors(
                 chosen = max(valid, key=lambda item: (item["confidence"], -item["position"]))
                 resolution = "ONLY_MATCH" if len(valid) == 1 else "SAME_ROOT"
             else:
-                chosen = min(valid, key=lambda item: item["position"]) if connector == "OBO" else max(valid, key=lambda item: item["position"])
-                resolution = f"{connector}_{'LEFT' if connector == 'OBO' else 'RIGHT'}"
+                chosen = max(valid, key=lambda item: item["position"]) if connector == "OBO" else min(valid, key=lambda item: item["position"])
+                resolution = f"{connector}_{'RIGHT' if connector == 'OBO' else 'LEFT'}"
             confidence = chosen["confidence"]
             proposal = chosen["proposal"]
             runner = chosen["runner"]
