@@ -680,6 +680,20 @@ def _decide_connectors(
 ) -> list[FinalDecision]:
     matching_cfg = config.get("matching", {})
     minimum_margin = float(matching_cfg.get("minimum_root_margin", 0.04))
+    decision_cfg = config.get("decision", {})
+    # This is an enhanced-rules recovery only. The ML decisions and the
+    # ordinary connector policy continue to use the existing cutoff.
+    short_name_enabled = (
+        scorer.plain_threshold is not None
+        and bool(decision_cfg.get("rules_enhanced_enabled", False))
+        and bool(decision_cfg.get("rules_connector_short_name_enabled", False))
+    )
+    if short_name_enabled:
+        from .rules_enhancement import _root_token_index, _unique_official_short_token
+        root_tokens = _root_token_index(graph)
+        short_floor = float(decision_cfg.get("rules_containment_min_confidence", 0.40))
+        short_margin = float(decision_cfg.get("rules_containment_min_margin", 0.08))
+        short_lexical = float(decision_cfg.get("rules_containment_min_lexical", 0.50))
     contexts: list[dict[str, Any]] = []
     vectors: list[list[float]] = []
     destinations: list[tuple[int, int, MatchProposal]] = []
@@ -750,13 +764,19 @@ def _decide_connectors(
             item["top"] = top
             confidence, proposal = top if top else (0.0, None)
             margin = confidence - (runner[0] if runner else 0.0)
+            short_name_match = bool(
+                short_name_enabled and proposal is not None and eligible
+                and confidence < scorer.system_threshold
+                and confidence >= short_floor and margin >= short_margin
+                and _unique_official_short_token(mention.text, proposal, root_tokens, short_lexical)
+            )
             if proposal is None:
                 reason = "NO_CANDIDATES"
             elif not eligible:
                 reason = _guard_reason(proposal, matching_cfg) or "INSUFFICIENT_SUPPORT"
             elif runner and margin < minimum_margin:
                 reason = "AMBIGUOUS_FINAL_TARGETS"
-            elif confidence < scorer.system_threshold:
+            elif confidence < scorer.system_threshold and not short_name_match:
                 reason = "INSUFFICIENT_SUPPORT"
             else:
                 reason = "MATCH"
@@ -770,12 +790,13 @@ def _decide_connectors(
                 "runner_up_root_id": runner[1].root_party_id if runner else None,
                 "runner_up_score": runner[0] if runner else None,
                 "margin": margin if proposal else None,
+                "decision_tier": "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME" if short_name_match and reason == "MATCH" else None,
             }
             mention_results.append(result)
             if reason == "MATCH":
                 valid.append({"position": mention.position, "confidence": confidence, "proposal": proposal,
                               "runner": runner[1] if runner else None, "runner_score": runner[0] if runner else None,
-                              "margin": margin})
+                              "margin": margin, "decision_tier": result["decision_tier"]})
             elif proposal and (best_rejected is None or confidence > best_rejected[0]):
                 best_rejected = (confidence, proposal)
         retrieved_roots = [root for root, _ in sorted(retrieved.items(), key=lambda item: (-item[1], item[0]))]
@@ -822,8 +843,11 @@ def _decide_connectors(
             decision = _no_match(
                 record, "MATCH", confidence, proposal=proposal, runner=runner,
                 runner_score=chosen["runner_score"], margin=chosen["margin"],
-                retrieved_roots=retrieved_roots, decision_tier=_decision_tier(proposal, matching_cfg),
+                retrieved_roots=retrieved_roots,
+                decision_tier=chosen["decision_tier"] or _decision_tier(proposal, matching_cfg),
             )
+            if chosen["decision_tier"]:
+                decision.match_method = "rules:root_unique_connector_short_name"
             decision.provisional_party_id = proposal.root_party_id
             decision.provisional_party_name = proposal.root_party_name
             decision.selected_mention_position = chosen["position"]
@@ -989,7 +1013,7 @@ def run_matching(
     rules_decisions = [rules_by_id[record.adm_party_id] for record in records]
     for decision in rules_decisions:
         event_job = party_job.get(str(decision.matched_member_id or decision.verified_party_id), default_job)
-        if decision.decision_tier == "RULES_UNIQUE_CONTAINMENT":
+        if decision.decision_tier in {"RULES_UNIQUE_CONTAINMENT", "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME"}:
             rules_cutoff = min(rules_scorer.plain_threshold, containment_floor)
         elif decision.connector is None and decision.connector_resolution is None:
             rules_cutoff = rules_scorer.plain_threshold
@@ -1098,6 +1122,11 @@ def run_matching(
         "rules_containment_max_token_df": int(config.get("decision", {}).get("rules_containment_max_token_df", 3)),
         "rules_containment_matches": sum(
             decision.decision == "MATCH" and decision.decision_tier == "RULES_UNIQUE_CONTAINMENT"
+            for decision in rules_decisions
+        ),
+        "rules_connector_short_name_enabled": bool(config.get("decision", {}).get("rules_connector_short_name_enabled", False)),
+        "rules_connector_short_name_matches": sum(
+            decision.decision == "MATCH" and decision.decision_tier == "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME"
             for decision in rules_decisions
         ),
         "strategy": effective_strategy,

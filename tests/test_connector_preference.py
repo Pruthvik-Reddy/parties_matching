@@ -74,6 +74,70 @@ class ConnectorPreferenceTests(unittest.TestCase):
             self.assertEqual((decision.decision, decision.verified_party_id,
                               decision.connector_resolution), ("MATCH", "right", "ONLY_MATCH"))
 
+    def test_rules_only_recovers_unique_short_left_without_changing_ml(self):
+        graph = VerifiedGraph("account", "unused-graph.json", load_existing=False)
+        graph.add_parties([
+            {"partyId": "carahsoft", "partyName": "Carahsoft Technology Corp."},
+            {"partyId": "agency", "partyName": "Arizona Department of Gaming"},
+        ])
+        record = PartyRecord("account", "connector-1", "Carahsoft OBO Arizona Department of Gaming", 1)
+        proposals = []
+        for mention, root_id, official, score, lexical in zip(
+            parse_mentions(record), ("carahsoft", "agency"),
+            ("Carahsoft Technology Corp.", "Arizona Department of Gaming"),
+            (0.69, 0.99), (0.60, 1.0),
+        ):
+            proposals.append(MatchProposal(
+                adm_party_id=record.adm_party_id, mention_id=mention.mention_id,
+                mention_text=mention.text, connector_before=mention.connector_before,
+                connector_after=mention.connector_after, owner_party_id=root_id,
+                owner_party_name=official, root_party_id=root_id,
+                root_party_name=official, matched_name=official,
+                candidate_type="official", candidate_source="verified",
+                candidate_confidence=None, feature_score=score,
+                char_tfidf_score=lexical,
+            ))
+        config = {"matching": {"connector_policy": "positional", "cross_encoder_mode": "off"},
+                  "decision": {"rules_enhanced_enabled": True,
+                               "rules_connector_short_name_enabled": True}}
+        rules = decide_records([record], {record.adm_party_id: proposals}, graph,
+                               IdentityScorer(0.8), NoReranker(), config)[0]
+        ml = decide_records([record], {record.adm_party_id: proposals}, graph,
+                            IdentityScorer(None), NoReranker(), config)[0]
+        self.assertEqual((rules.decision, rules.verified_party_id, rules.selected_mention_position),
+                         ("MATCH", "carahsoft", 0))
+        self.assertEqual(rules.decision_tier, "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME")
+        self.assertEqual((ml.decision, ml.verified_party_id), ("MATCH", "agency"))
+
+    def test_short_name_is_not_recovered_when_token_has_multiple_roots(self):
+        graph = VerifiedGraph("account", "unused-graph.json", load_existing=False)
+        graph.add_parties([
+            {"partyId": "first", "partyName": "Northfield Corporation"},
+            {"partyId": "second", "partyName": "Northfield Research"},
+            {"partyId": "right", "partyName": "Beta Inc"},
+        ])
+        record = PartyRecord("account", "connector-2", "Northfield OBO Beta Inc", 2)
+        proposals = []
+        for mention, root_id, official, score in zip(
+            parse_mentions(record), ("first", "right"), ("Northfield Corporation", "Beta Inc"), (0.69, 0.99),
+        ):
+            proposals.append(MatchProposal(
+                adm_party_id=record.adm_party_id, mention_id=mention.mention_id,
+                mention_text=mention.text, connector_before=mention.connector_before,
+                connector_after=mention.connector_after, owner_party_id=root_id,
+                owner_party_name=official, root_party_id=root_id,
+                root_party_name=official, matched_name=official,
+                candidate_type="official", candidate_source="verified",
+                candidate_confidence=None, feature_score=score,
+                char_tfidf_score=0.8,
+            ))
+        config = {"matching": {"connector_policy": "positional", "cross_encoder_mode": "off"},
+                  "decision": {"rules_enhanced_enabled": True,
+                               "rules_connector_short_name_enabled": True}}
+        decision = decide_records([record], {record.adm_party_id: proposals}, graph,
+                                  IdentityScorer(0.8), NoReranker(), config)[0]
+        self.assertEqual((decision.decision, decision.verified_party_id), ("MATCH", "right"))
+
 
 if __name__ == "__main__":
     unittest.main()
