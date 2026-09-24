@@ -15,7 +15,10 @@ from .domain import normalize_name, read_json, read_jsonl, write_json
 DETAIL_COLUMNS = ["Unverified Party", "Verified Party - Matched", "Verified Party - Label", "Result", "Rules-only prediction"]
 
 
-def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: dict[str, Any]) -> dict[str, Any]:
+def build_reports(
+    prepared_dir: str | Path, output_dir: str | Path, run_stats: dict[str, Any],
+    rules_demo_only: bool = False,
+) -> dict[str, Any]:
     prepared, output = Path(prepared_dir), Path(output_dir)
     manifest = read_json(prepared / "manifest.json", {}) or {}
     labels = {row["adm_party_id"]: row for row in read_jsonl(prepared / "labels.jsonl")}
@@ -153,6 +156,14 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
         prediction["Error Bucket"] = _error_bucket(prediction)
         prediction["Case Types"] = _join(_case_types(raw_name, prediction))
         detail_rows.append({"source": source_row["source"], "prediction": prediction})
+    if rules_demo_only and not rules_decisions:
+        raise FileNotFoundError(f"Rules decisions not found: {rules_path}")
+    if rules_demo_only:
+        rules_rows = _rules_demo_rows(detail_rows, rules_decisions, manifest)
+        rules_metrics = _metrics(rules_rows, run_stats)
+        _write_workbook(output / "predictions_rules_only.xlsx", rules_rows, manifest,
+                        rules_metrics, run_stats, view="rules")
+        return rules_metrics
     _write_rules_changes(output / "rules_changes.csv", detail_rows, manifest,
                          prior_rules_decisions, rules_decisions)
     metrics = _metrics(detail_rows, run_stats)
@@ -168,6 +179,48 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
     _write_analysis(output / "analysis.md", metrics, run_stats)
     _write_workbook(output / "predictions.xlsx", detail_rows, manifest, metrics, run_stats)
     return metrics
+
+
+def _rules_demo_rows(
+    detail_rows: list[dict[str, Any]], rules_decisions: dict[str, dict[str, Any]],
+    manifest: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Project rules decisions into the established report schema; do not mutate ML rows."""
+    projected = []
+    for row in detail_rows:
+        ml = row["prediction"]
+        rule = rules_decisions.get(ml["ADM Party ID"])
+        if rule is None:
+            raise ValueError(f"Missing rules decision for {ml['ADM Party ID']}")
+        prediction = dict(ml)
+        is_match = rule.get("decision") == "MATCH"
+        target = rule.get("verified_party_id") if is_match else None
+        expected = prediction.get("Expected Verified ID")
+        retrieved = list(rule.get("retrieved_root_ids") or [])
+        prediction.update({
+            "Decision": rule.get("decision"),
+            "Correct": (target == expected) if prediction["Scorable"] and is_match
+                       else (False if prediction["Scorable"] else None),
+            "Confidence": rule.get("confidence"),
+            "Reason": rule.get("reason"),
+            "Event Emitted": False,
+            "Predicted Verified ID": target,
+            "Predicted Verified Name": rule.get("verified_party_name") if is_match else None,
+            "Expected Target Retrieved": expected in retrieved if expected else None,
+            "Expected Target Rank": retrieved.index(expected) + 1 if expected in retrieved else None,
+            "Expected Segment Seen": any(item.get("root_id") == expected
+                                         for item in rule.get("mention_results") or []) if expected else False,
+            "Connector Resolution": rule.get("connector_resolution"),
+            "Selected Mention Position": rule.get("selected_mention_position"),
+            "Rules-only Verified ID": target,
+            "Rules-only prediction": rule.get("verified_party_name") if is_match else "NO_MATCH",
+            "Rules-only Decision Tier": rule.get("decision_tier"),
+        })
+        prediction["Error Bucket"] = _error_bucket(prediction)
+        raw_name = str(row["source"].get(manifest.get("raw_name_column")) or "")
+        prediction["Case Types"] = _join(_case_types(raw_name, prediction))
+        projected.append({"source": row["source"], "prediction": prediction})
+    return projected
 
 
 def _write_rules_changes(
@@ -448,9 +501,14 @@ def _write_workbook(
     manifest: dict[str, Any],
     metrics: dict[str, Any],
     run_stats: dict[str, Any],
+    view: str = "ml",
 ) -> None:
+    if view not in {"ml", "rules"}:
+        raise ValueError(f"Unknown workbook view: {view}")
+    is_rules = view == "rules"
     workbook = xlsxwriter.Workbook(path, {"constant_memory": True, "strings_to_formulas": False, "strings_to_urls": False})
-    workbook.set_properties({"title": "Party matching predictions", "subject": "POC evaluation output"})
+    workbook.set_properties({"title": "Rules-only party matching predictions" if is_rules else "Party matching predictions",
+                             "subject": "POC evaluation output"})
     title = workbook.add_format({"font_name": "Arial", "font_size": 14, "bold": True, "font_color": "#1F2937"})
     section = workbook.add_format({"font_name": "Arial", "bold": True, "font_color": "#FFFFFF", "bg_color": "#1F4E78"})
     header = workbook.add_format({
@@ -512,21 +570,26 @@ def _write_workbook(
     summary = workbook.add_worksheet("Stats")
     summary.hide_gridlines(2)
     summary.set_tab_color("#1F4E78")
-    summary.write("A2", "Party matching evaluation", title)
+    summary.write("A2", "Rules-only party matching evaluation" if is_rules else "Party matching evaluation", title)
     _section_band(summary, 3, 0, 1, "Run summary", section)
-    _section_band(summary, 3, 3, 8, "Held-out ML versus rules-only", section)
-    _section_band(summary, 3, 11, 12, "Matching stage profile", section)
+    _section_band(summary, 3, 3, 8, "Held-out rules-only" if is_rules else "Held-out ML versus rules-only", section)
+    if not is_rules:
+        _section_band(summary, 3, 11, 12, "Matching stage profile", section)
     summary.write_row("A5", ["Metric", "Value"], header)
     summary.write_row(4, 3, ["Method", "Matches", "Correct", "Precision", "Recall", "F1"], header)
-    summary.write_row(4, 11, ["Stage", "Seconds / MB"], header)
+    if not is_rules:
+        summary.write_row(4, 11, ["Stage", "Seconds / MB"], header)
     overall = metrics["overall"]
-    for row_number, name, values in (
-        (5, "ML", overall),
-        (6, "Rules only - enhanced", metrics["rules_only"]),
-        (7, "Rules only - before core anchor", metrics["rules_only"]["before_core_anchor"]),
-        (8, "Rules only - previous", metrics["rules_only"]["prior_rules"]),
-        (9, "Rules only - no containment", metrics["rules_only"]["baseline_without_containment"]),
-    ):
+    method_rows = (
+        ((5, "Enhanced rules", overall),) if is_rules else (
+            (5, "ML", overall),
+            (6, "Rules only - enhanced", metrics["rules_only"]),
+            (7, "Rules only - before core anchor", metrics["rules_only"]["before_core_anchor"]),
+            (8, "Rules only - previous", metrics["rules_only"]["prior_rules"]),
+            (9, "Rules only - no containment", metrics["rules_only"]["baseline_without_containment"]),
+        )
+    )
+    for row_number, name, values in method_rows:
         summary.write_string(row_number, 3, name, text)
         summary.write_number(row_number, 4, values["matches"], integer)
         summary.write_number(row_number, 5, values["correct_matches"], integer)
@@ -574,6 +637,34 @@ def _write_workbook(
         ("Held-out ML/rules disagreements", metrics["rules_only"]["disagreements"], integer),
         ("Held-out preferred-part abstentions", metrics["cohorts"]["PREFERRED_NEAR_CUTOFF"]["rows"], integer),
     ]
+    if is_rules:
+        # The demo workbook is self-contained: all counts and rates come from
+        # rules decisions, with no ML events, cutoffs, or comparison rows.
+        summary_values = [
+            ("Original workbook rows", manifest.get("rows"), integer),
+            ("Cleaned unverified rows", manifest.get("cleaned_unverified_rows", run_stats.get("records")), integer),
+            ("Exact duplicate rows excluded", cleaning.get("EXACT_DUPLICATE", 0), integer),
+            ("Verified self-rows excluded", cleaning.get("VERIFIED_SELF_ROW", 0), integer),
+            ("Conflicting-label rows excluded", cleaning.get("CONFLICTING_LABELS", 0), integer),
+            ("Held-out labeled rows", overall["scorable"], integer),
+            ("Held-out rules matches", overall["matches"], integer),
+            ("Held-out correct matches", overall["correct_matches"], integer),
+            ("Held-out precision", overall["precision"], percent),
+            ("Precision 95% CI low", overall["precision_ci_95_low"], percent),
+            ("Precision 95% CI high", overall["precision_ci_95_high"], percent),
+            ("Held-out recall", overall["recall"], percent),
+            ("Held-out F1", overall["f1"], percent),
+            ("Held-out coverage", overall["coverage"], percent),
+            ("Held-out retrieval recall", overall["retrieval_recall"], percent),
+            ("Unknown rows (not scored)", metrics["unknown_predictions"]["rows"], integer),
+            ("Unknown rules matches", metrics["unknown_predictions"]["matches"], integer),
+            ("Rules-only connector cutoff", run_stats.get("rules_system_threshold"), decimal),
+            ("Rules-only plain cutoff", run_stats.get("rules_plain_threshold"), decimal),
+            ("Rules enhancement enabled", "yes" if run_stats.get("rules_enhanced_enabled") else "no", text),
+            ("Rules short-name matches", (run_stats.get("rules_enhancement") or {}).get("short_name_matches"), integer),
+            ("Rules safe-view matches", (run_stats.get("rules_enhancement") or {}).get("safe_view_matches"), integer),
+            ("Rules core-anchor matches", (run_stats.get("rules_enhancement") or {}).get("core_anchor_matches"), integer),
+        ]
     profile_keys = (
         "graph_seconds", "index_seconds", "retrieval_seconds", "retrieval_query_seconds", "char_matrix_seconds",
         "word_matrix_seconds", "shortlist_seconds", "proposal_build_seconds",
@@ -582,6 +673,8 @@ def _write_workbook(
         "rules_enhancement_seconds",
         "write_seconds", "peak_rss_mb",
     )
+    if is_rules:
+        profile_keys = ()
     for offset in range(max(len(summary_values), len(profile_keys))):
         row_number = offset + 5
         if offset < len(summary_values):
@@ -645,8 +738,11 @@ def _write_workbook(
                 summary.write(row_number, column, values[key], percent)
 
     reliability_start = category_start + 4 + len(metrics["by_category"])
-    _section_band(summary, reliability_start, 0, 3, "Confidence reliability", section)
-    summary.write_row(reliability_start + 1, 0, ["Confidence bucket", "Matches", "Average confidence", "Observed accuracy"], header)
+    _section_band(summary, reliability_start, 0, 3,
+                  "Rules score accuracy by bucket" if is_rules else "Confidence reliability", section)
+    summary.write_row(reliability_start + 1, 0,
+                      ["Score bucket", "Matches", "Average score", "Observed accuracy"] if is_rules
+                      else ["Confidence bucket", "Matches", "Average confidence", "Observed accuracy"], header)
     for row_number, values in enumerate(metrics["confidence_bins"], start=reliability_start + 2):
         summary.write(row_number, 0, values["bucket"], text)
         summary.write(row_number, 1, values["matches"], integer)
@@ -671,7 +767,8 @@ def _write_workbook(
     detail = workbook.add_worksheet("Detail")
     detail.hide_gridlines(2)
     detail.freeze_panes(1, 1)
-    detail.write_row(0, 0, DETAIL_COLUMNS, header)
+    detail_columns = DETAIL_COLUMNS[:4] if is_rules else DETAIL_COLUMNS
+    detail.write_row(0, 0, detail_columns, header)
     for row_number, row in enumerate(rows, start=1):
         prediction = row["prediction"]
         is_match = prediction["Decision"] == "MATCH"
@@ -688,8 +785,9 @@ def _write_workbook(
             prediction.get("Predicted Verified Name") if is_match else "NO_MATCH",
             correct_answer,
             result,
-            prediction.get("Rules-only prediction"),
         ]
+        if not is_rules:
+            values.append(prediction.get("Rules-only prediction"))
         for column, value in enumerate(values):
             if isinstance(value, (list, tuple, set)):
                 value = _join(value)
@@ -702,25 +800,25 @@ def _write_workbook(
                 detail.write_blank(row_number, column, None, text)
             else:
                 detail.write_string(row_number, column, str(value)[:32_767], text)
-    detail.autofilter(0, 0, len(rows), len(DETAIL_COLUMNS) - 1)
+    detail.autofilter(0, 0, len(rows), len(detail_columns) - 1)
     detail.set_row(0, 30)
-    for column, width in enumerate((48, 48, 48, 18, 48)):
+    for column, width in enumerate((48, 48, 48, 18) if is_rules else (48, 48, 48, 18, 48)):
         detail.set_column(column, column, width)
     match_format = workbook.add_format({"bg_color": "#E2F0D9", "font_color": "#275D38"})
     no_match_format = workbook.add_format({"bg_color": "#FFF2CC", "font_color": "#7F6000"})
     wrong_match_format = workbook.add_format({"bg_color": "#FCE8E6", "font_color": "#9C2F24"})
     unscored_format = workbook.add_format({"bg_color": "#F2F4F7", "font_color": "#4B5563"})
     if rows:
-        detail.conditional_format(1, 0, len(rows), 4, {
+        detail.conditional_format(1, 0, len(rows), len(detail_columns) - 1, {
             "type": "formula", "criteria": '=$D2="Correct"', "format": match_format,
         })
-        detail.conditional_format(1, 0, len(rows), 4, {
+        detail.conditional_format(1, 0, len(rows), len(detail_columns) - 1, {
             "type": "formula", "criteria": '=$D2="No match"', "format": no_match_format,
         })
-        detail.conditional_format(1, 0, len(rows), 4, {
+        detail.conditional_format(1, 0, len(rows), len(detail_columns) - 1, {
             "type": "formula", "criteria": '=$D2="Wrong match"', "format": wrong_match_format,
         })
-        detail.conditional_format(1, 0, len(rows), 4, {
+        detail.conditional_format(1, 0, len(rows), len(detail_columns) - 1, {
             "type": "formula", "criteria": '=$D2="Not scored"', "format": unscored_format,
         })
     workbook.close()

@@ -64,6 +64,7 @@ Each run writes:
 - `events.jsonl`: API-shaped accepted mapping events.
 - `decisions.jsonl`: every ML-path decision and its evidence; `rules_decisions.jsonl` holds enhanced rules comparison decisions, and `rules_baseline_decisions.jsonl` preserves the previous rules decisions. Neither rules file emits events.
 - `predictions.xlsx`: `Summary` compares ML predictions and ground truth by verified root; `Stats` compares held-out ML and rules-only precision/recall/F1; `Detail` has every cleaned unverified row in five columns, including a rules-only prediction.
+- `predictions_rules_only.xlsx` (opt-in): demo workbook with the same Summary/Stats/Detail structure, but its matches, row colors, and all reported evaluation metrics use the enhanced rules decisions only. It has no ML comparison column or ML results.
 - `data/prepared/cleaning_report.json` and `excluded_rows.jsonl`: counts and source-row references for exact duplicates, verified self-rows, and conflicting labels set aside during preparation.
 - `run_metrics.json`: full held-out, split, case and confidence metrics.
 - `rules_changes.csv`: only rows where the enhanced rules prediction differs from the previous rules prediction, with the label and correctness for review.
@@ -71,6 +72,14 @@ Each run writes:
 - `run_stats.json` and `analysis.md`.
 
 Evaluation should use `--fresh-state`. Incremental runs omit that flag and reuse `state/<account>/graph.json` plus `mappings.jsonl`.
+
+To make the rules-only demo workbook from a **completed** run, without training or matching again:
+
+```bash
+PYTHONPATH=src python scripts/report_rules.py --run outputs/YOUR_RUN_FOLDER
+```
+
+This writes only `predictions_rules_only.xlsx` inside that run folder and leaves `predictions.xlsx`, decisions, events, and other reports unchanged. Its held-out recall is correct enhanced-rules matches divided by all scorable held-out rows, so `NO_MATCH` rows count against recall. Use the same `data/prepared` dataset that produced the run.
 
 ## Temporary rules diagnosis
 
