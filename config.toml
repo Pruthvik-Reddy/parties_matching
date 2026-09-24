@@ -67,6 +67,12 @@ request_confidence_cutoff = 0.0
 fallback_system_threshold = 0.90
 minimum_calibration_matches = 100
 calibration_method = "isotonic" # isotonic | none
+rules_plain_threshold = 0.80 # rules-only comparison, plain names only; ML and OBO/VIA unchanged
+rules_containment_enabled = true # set false to compare against the plain-cutoff baseline
+rules_containment_min_confidence = 0.40
+rules_containment_min_margin = 0.08
+rules_containment_min_lexical = 0.50
+rules_containment_max_token_df = 3
 
 [execution]
 mode = "parallel" # serial | parallel

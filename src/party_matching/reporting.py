@@ -87,6 +87,7 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
             "Predicted Verified Name": candidate_name if is_match else None,
             "Rules-only Verified ID": rules_decision.get("verified_party_id") if rules_match else None,
             "Rules-only prediction": rules_decision.get("verified_party_name") if rules_match else ("NO_MATCH" if rules_decision else None),
+            "Rules-only Decision Tier": rules_decision.get("decision_tier"),
             "Top Candidate Verified ID": candidate_id,
             "Top Candidate Verified Name": candidate_name,
             "Matched Member ID": decision.get("matched_member_id"),
@@ -285,6 +286,22 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
     )
     rules_precision = rules_correct / len(rules_matches) if rules_matches else None
     rules_recall = rules_correct / len(held_out) if held_out else None
+    baseline_matches = [row for row in rules_matches
+                        if row["prediction"].get("Rules-only Decision Tier") != "RULES_UNIQUE_CONTAINMENT"]
+    baseline_correct = sum(
+        row["prediction"]["Rules-only Verified ID"] == row["prediction"]["Expected Verified ID"]
+        for row in baseline_matches
+    )
+    baseline_precision = baseline_correct / len(baseline_matches) if baseline_matches else None
+    baseline_recall = baseline_correct / len(held_out) if held_out else None
+
+    def containment_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        selected = [row["prediction"] for row in rows
+                    if row["prediction"].get("Rules-only Verified ID")
+                    and row["prediction"].get("Rules-only Decision Tier") == "RULES_UNIQUE_CONTAINMENT"]
+        correct = sum(row["Rules-only Verified ID"] == row["Expected Verified ID"] for row in selected)
+        return {"matches": len(selected), "correct": correct,
+                "precision": correct / len(selected) if selected else None}
     return {
         "overall": summarize(held_out),
         "rules_only": {
@@ -298,6 +315,20 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
                 row["prediction"].get("Predicted Verified ID") != row["prediction"].get("Rules-only Verified ID")
                 for row in held_out
             ),
+            "containment": {
+                "calibration": containment_summary([
+                    row for row in detail_rows if row["prediction"]["Dataset Split"] == "CALIBRATION"
+                    and row["prediction"]["Scorable"]
+                ]),
+                "held_out": containment_summary(held_out),
+            },
+            "baseline_without_containment": {
+                "matches": len(baseline_matches), "correct_matches": baseline_correct,
+                "precision": baseline_precision, "recall": baseline_recall,
+                "f1": 2 * baseline_precision * baseline_recall / (baseline_precision + baseline_recall)
+                if baseline_precision is not None and baseline_recall is not None
+                and baseline_precision + baseline_recall else None,
+            },
         },
         "all_labeled": summarize(all_labeled),
         "cohorts": cohorts,
@@ -418,7 +449,11 @@ def _write_workbook(
     summary.write_row(4, 3, ["Method", "Matches", "Correct", "Precision", "Recall", "F1"], header)
     summary.write_row(4, 11, ["Stage", "Seconds / MB"], header)
     overall = metrics["overall"]
-    for row_number, name, values in ((5, "ML", overall), (6, "Rules only", metrics["rules_only"])):
+    for row_number, name, values in (
+        (5, "ML", overall),
+        (6, "Rules only + containment", metrics["rules_only"]),
+        (7, "Rules only baseline", metrics["rules_only"]["baseline_without_containment"]),
+    ):
         summary.write_string(row_number, 3, name, text)
         summary.write_number(row_number, 4, values["matches"], integer)
         summary.write_number(row_number, 5, values["correct_matches"], integer)
@@ -449,7 +484,16 @@ def _write_workbook(
         ("Matching runtime (seconds)", run_stats.get("total_seconds"), decimal),
         ("System threshold", run_stats.get("system_threshold"), decimal),
         ("Effective cutoff", run_stats.get("effective_cutoff"), decimal),
-        ("Rules-only threshold", run_stats.get("rules_system_threshold"), decimal),
+        ("Rules-only connector cutoff", run_stats.get("rules_system_threshold"), decimal),
+        ("Rules-only plain cutoff", run_stats.get("rules_plain_threshold", run_stats.get("rules_system_threshold")), decimal),
+        ("Rules containment enabled", "yes" if run_stats.get("rules_containment_enabled") else "no", text),
+        ("Rules-only containment floor", run_stats.get("rules_containment_min_confidence"), decimal),
+        ("Rules containment calibration matches", metrics["rules_only"]["containment"]["calibration"]["matches"], integer),
+        ("Rules containment calibration correct", metrics["rules_only"]["containment"]["calibration"]["correct"], integer),
+        ("Rules containment calibration precision", metrics["rules_only"]["containment"]["calibration"]["precision"], percent),
+        ("Rules containment held-out matches", metrics["rules_only"]["containment"]["held_out"]["matches"], integer),
+        ("Rules containment held-out correct", metrics["rules_only"]["containment"]["held_out"]["correct"], integer),
+        ("Rules containment held-out precision", metrics["rules_only"]["containment"]["held_out"]["precision"], percent),
         ("Held-out ML/rules disagreements", metrics["rules_only"]["disagreements"], integer),
         ("Held-out preferred-part abstentions", metrics["cohorts"]["PREFERRED_NEAR_CUTOFF"]["rows"], integer),
     ]
@@ -540,7 +584,7 @@ def _write_workbook(
 
     summary.set_column("A:A", 42)
     summary.set_column("B:C", 14)
-    summary.set_column("D:D", 19)
+    summary.set_column("D:D", 27)
     summary.set_column("E:F", 14)
     summary.set_column("G:I", 16)
     summary.set_column("J:J", 16)

@@ -258,6 +258,7 @@ class FeatureScorer:
         self.timing: dict[str, float] = defaultdict(float)
         self.idf = self.artifact.get("idf", {})
         self.system_threshold = float(self.artifact.get("system_threshold", 0.90))
+        self.plain_threshold: float | None = None
         artifact_features = self.artifact.get("identity_features")
         if artifact_features and list(artifact_features) != IDENTITY_FEATURES:
             raise RuntimeError("Matcher feature schema changed. Run scripts/train.py again.")
@@ -550,6 +551,7 @@ def _decide_records_legacy(
         contexts.append({
             "record": record,
             "parse_warning": parse_warning,
+            "plain": len(mentions) == 1 and parse_warning != "MALFORMED_CONNECTOR",
             "retrieved_roots": [proposal.root_party_id for proposal in identity_order],
             "scored_roots": [],
         })
@@ -606,7 +608,16 @@ def _decide_records_legacy(
                 decision_tier=decision_tier,
             )
             continue
-        if confidence < scorer.system_threshold:
+        threshold = scorer.plain_threshold if context["plain"] and scorer.plain_threshold is not None else scorer.system_threshold
+        containment = (
+            context["plain"] and scorer.plain_threshold is not None
+            and bool(config.get("decision", {}).get("rules_containment_enabled", False))
+            and confidence < threshold
+            and _rules_containment_evidence(winner, scorer.idf, len(graph.nodes), margin, config)
+        )
+        if containment:
+            threshold = min(threshold, float(config["decision"].get("rules_containment_min_confidence", 0.40)))
+        if confidence < threshold:
             completed[record.adm_party_id] = _no_match(
                 record, "INSUFFICIENT_SUPPORT", confidence=confidence, proposal=winner,
                 runner=runner, runner_score=runner_score, margin=margin,
@@ -615,6 +626,8 @@ def _decide_records_legacy(
             )
             continue
         path = graph.path_to_root(winner.owner_party_id)
+        if containment:
+            decision_tier = "RULES_UNIQUE_CONTAINMENT"
         completed[record.adm_party_id] = FinalDecision(
             account_id=record.account_id,
             adm_party_id=record.adm_party_id,
@@ -631,7 +644,7 @@ def _decide_records_legacy(
             candidate_expansion_confidence=winner.candidate_confidence,
             matched_mention=winner.mention_text,
             connector=winner.connector_before or winner.connector_after,
-            match_method=_match_method(winner),
+            match_method="rules:unique_containment" if containment else _match_method(winner),
             decision_tier=decision_tier,
             retrieval_sources=winner.retrieval_sources,
             identity_score=winner.feature_score,
@@ -942,6 +955,14 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
     rules_scorer.system_threshold = float(scorer.artifact.get(
         "rules_system_threshold", config.get("decision", {}).get("fallback_system_threshold", 0.90),
     ))
+    rules_scorer.plain_threshold = float(config.get("decision", {}).get(
+        "rules_plain_threshold", rules_scorer.system_threshold,
+    ))
+    if not 0.0 <= rules_scorer.plain_threshold <= 1.0:
+        raise ValueError("decision.rules_plain_threshold must be between 0 and 1")
+    containment_floor = float(config.get("decision", {}).get("rules_containment_min_confidence", 0.40))
+    if not 0.0 <= containment_floor <= 1.0:
+        raise ValueError("decision.rules_containment_min_confidence must be between 0 and 1")
     for record_proposals in proposals.values():
         for proposal in record_proposals:
             proposal.feature_score = proposal.rules_score
@@ -962,7 +983,13 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
     rules_decisions = [rules_by_id[record.adm_party_id] for record in records]
     for decision in rules_decisions:
         event_job = party_job.get(str(decision.matched_member_id or decision.verified_party_id), default_job)
-        decision_cutoff = max(rules_scorer.system_threshold, float(event_job.get("confidenceCutoff", 0.0)))
+        if decision.decision_tier == "RULES_UNIQUE_CONTAINMENT":
+            rules_cutoff = min(rules_scorer.plain_threshold, containment_floor)
+        elif decision.connector is None and decision.connector_resolution is None:
+            rules_cutoff = rules_scorer.plain_threshold
+        else:
+            rules_cutoff = rules_scorer.system_threshold
+        decision_cutoff = max(rules_cutoff, float(event_job.get("confidenceCutoff", 0.0)))
         if decision.decision == "MATCH" and decision.confidence < decision_cutoff:
             decision.decision = "NO_MATCH"
             decision.reason = "BELOW_REQUEST_CUTOFF"
@@ -1030,6 +1057,16 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
         "effective_cutoff": effective_cutoff,
         "system_threshold": scorer.system_threshold,
         "rules_system_threshold": rules_scorer.system_threshold,
+        "rules_plain_threshold": rules_scorer.plain_threshold,
+        "rules_containment_enabled": bool(config.get("decision", {}).get("rules_containment_enabled", False)),
+        "rules_containment_min_confidence": containment_floor,
+        "rules_containment_min_margin": float(config.get("decision", {}).get("rules_containment_min_margin", 0.08)),
+        "rules_containment_min_lexical": float(config.get("decision", {}).get("rules_containment_min_lexical", 0.50)),
+        "rules_containment_max_token_df": int(config.get("decision", {}).get("rules_containment_max_token_df", 3)),
+        "rules_containment_matches": sum(
+            decision.decision == "MATCH" and decision.decision_tier == "RULES_UNIQUE_CONTAINMENT"
+            for decision in rules_decisions
+        ),
         "strategy": effective_strategy,
         "requested_strategy": strategy,
         "cross_encoder_mode": rerank_mode,
@@ -1464,6 +1501,34 @@ def _match_method(proposal: MatchProposal) -> str:
     if "embedding" in sources:
         return "feature:embedding"
     return "feature:" + ("_".join(lexical) if lexical else "retrieved")
+
+
+def _rules_containment_evidence(
+    proposal: MatchProposal, idf: dict[str, float], verified_count: int,
+    margin: float, config: dict[str, Any],
+) -> bool:
+    """Conservative rules-only path for a distinctive short name inside an official name."""
+    options = config.get("decision", {})
+    if (proposal.candidate_type != "official" or proposal.candidate_collision_count != 1
+            or proposal.digit_conflict or proposal.distinctive_token_conflict or not idf):
+        return False
+    if margin < float(options.get("rules_containment_min_margin", 0.08)):
+        return False
+    if max(proposal.char_tfidf_score, proposal.word_tfidf_score) < float(
+        options.get("rules_containment_min_lexical", 0.50)
+    ):
+        return False
+    ignore = LEGAL_SUFFIXES | {"a", "an", "the", "of", "and"}
+    short = set(normalize_name(proposal.mention_text).split()) - ignore
+    long = set(normalize_name(proposal.matched_name).split()) - ignore
+    if not short or not short < long or len(long - short) > 2:
+        return False
+    max_df = int(options.get("rules_containment_max_token_df", 3))
+    return any(
+        len(token) >= 5 and token in idf
+        and (verified_count + 1) / math.exp(idf[token] - 1) - 1 <= max_df + 1e-6
+        for token in short
+    )
 
 
 def _decision_tier(proposal: MatchProposal, config: dict[str, Any]) -> str:
