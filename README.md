@@ -45,10 +45,12 @@ python scripts/train.py
 python scripts/run.py --mode parallel --fresh-state
 ```
 
-For this decision-rule and report update, the existing trained artifact can be reused; the feature schema has not changed. After copying the changed source files, run from the repo root with `PYTHONPATH=src` so Python uses those files without reinstalling. `prepare.py` is only needed again if the workbook or preparation settings changed.
+After copying changes to preparation or reporting, run all three commands again. Use `PYTHONPATH=src` so Python uses the copied source files without reinstalling, and `--fresh-state` so the old graph and mappings do not contaminate the cleaned dataset.
 
 ```bash
-PYTHONPATH=src python scripts/run.py --mode parallel --fresh-state --output outputs/exp4
+PYTHONPATH=src python scripts/prepare.py --workbook "/path/to/related-parties.xlsx"
+PYTHONPATH=src python scripts/train.py
+PYTHONPATH=src python scripts/run.py --mode parallel --fresh-state --output outputs/cleaned_exp
 ```
 
 Use `--limit 1000` for a quick prefix sample or `--ids-file adm_ids.txt` for a targeted set of ADM IDs.
@@ -60,8 +62,9 @@ Add `--cross-encoder` to training only after the feature baseline works. Set `[e
 Each run writes:
 
 - `events.jsonl`: API-shaped accepted mapping events.
-- `decisions.jsonl`: every decision and its evidence.
-- `predictions.xlsx`: `Summary` groups every accepted raw-name match under its predicted verified party; `Stats` has run metrics; `Detail` has every source row.
+- `decisions.jsonl`: every ML-path decision and its evidence; `rules_decisions.jsonl` holds the comparison decisions and never emits events.
+- `predictions.xlsx`: `Summary` compares ML predictions and ground truth by verified root; `Stats` compares held-out ML and rules-only precision/recall/F1; `Detail` has every cleaned unverified row in five columns, including a rules-only prediction.
+- `data/prepared/cleaning_report.json` and `excluded_rows.jsonl`: counts and source-row references for exact duplicates, verified self-rows, and conflicting labels set aside during preparation.
 - `run_metrics.json`: full held-out, split, case and confidence metrics.
 - `diagnostics.json`: compact retrieval funnel, connector cohorts and error buckets.
 - `run_stats.json` and `analysis.md`.
@@ -73,15 +76,17 @@ Evaluation should use `--fresh-state`. Incremental runs omit that flag and reuse
 - Only verified parties are graph nodes.
 - Expansion candidates retrieve ADM names for their owner. `suggested_parent` never does.
 - Low-confidence LLM candidates and parents are discarded using the configurable expansion thresholds.
-- OBO and VIA segments are matched independently. A unique, long official-name prefix followed only by generic company descriptors (for example, `Carahsoft` for `Carahsoft Technology Corp.`) gets a narrow deterministic match rule. It does not lower the general cutoff; it is disabled when another verified root shares that prefix or owns the exact short name.
-- Distinct roots use the leftmost valid OBO segment or rightmost valid VIA segment. If that preferred segment is just below cutoff, the run abstains instead of automatically emitting the other segment. A uniquely identified short-name match on the preferred side can resolve a conflict directly; other conflicting-root choices still require the calibrated connector gate. Mixed or malformed connectors abstain. Set `connector_policy = "legacy"` to compare with the earlier pooled behavior.
+- OBO and VIA segments are retrieved and scored independently. There is no fixed-confidence short-name override; short forms must pass the same score and guard checks as other non-exact matches. Unique exact-name hits retain their existing deterministic score floor. `run_stats.json` records whether trained or fallback scoring was used.
+- Distinct roots use the leftmost valid OBO segment or rightmost valid VIA segment, preserving that segment's confidence. If the preferred segment is just below cutoff, the run abstains instead of automatically emitting the other segment. Mixed or malformed connectors abstain. Set `connector_policy = "legacy"` to compare with the earlier pooled behavior.
+- Remaining generic heuristics include the unique exact-name score floor, configured ambiguity/near-cutoff margins, and fallback scoring when a trained model is unavailable. These are not learned probabilities; check the scorer modes in `run_stats.json` and validate changes on held-out data.
 - Proposals are grouped by global root before distinct roots compete.
 - Retrieval is bounded by `max_roots_per_mention` and `max_variants_per_root`; cap-hit statistics are written to diagnostics.
 - Headline precision and recall use only untouched `TEST_KNOWN` and `TEST_UNSEEN` rows. Training and calibration results remain visible but are not mixed into the headline.
 - Evaluation resolves each workbook canonical label through the verified graph before comparing it with the emitted global parent.
 - OBO/VIA, no-OBO, no-VIA and plain-name cohorts are reported separately.
 - `UNKNOWN` rows appear in predictions but not supervised metrics.
-- Detail keeps one `Correct Answer` (the expected global parent), accepted prediction or `NO_MATCH`, a readable result and a small set of review clues. IDs and full scoring evidence remain in `decisions.jsonl`, not Excel. Stats shows unknown prediction count and connector cohorts. Summary lists all accepted matches by predicted verified party, including matches on unknown-label rows; large alias lists continue on additional rows. `run_stats.json` and `analysis.md` include stage timings and process-memory snapshots; `end_to_end_seconds` includes workbook generation.
+- Preparation uses exact raw-name and canonical-label text for duplicate and conflict checks; it does not normalize these labels or infer a merge from name similarity. An exact raw-name = canonical-name row is treated as a verified self-row, retained in the catalog but excluded from unverified matching and evaluation. Duplicate raw+label pairs collapse to their first row. Raw names carrying two distinct known labels are set aside for review. The source workbook stays unchanged.
+- Detail shows unverified name, ML match (or `NO_MATCH`), graph-root label, ML result, and rules-only prediction. Green/red/neutral shading reflects the ML result. Rules-only uses the same retrieved candidates and guards, but no trained identity/target model, calibration, or cross-encoder; it gets a separate cutoff selected on calibration data. Summary and events remain ML-based. IDs and scoring evidence remain in the JSONL files, not Excel. Summary includes unknown-label predictions but does not count them as correct; long alias lists spill into continuation rows without repeating counts. `run_stats.json` and `analysis.md` include stage timings and process-memory snapshots; `end_to_end_seconds` includes workbook generation.
 - Rows that already have a verified parent remain in predictions, but are excluded from matching, training, and supervised metrics.
 - The matcher never reads `labels.jsonl`; only reporting and training do.
 - A matcher artifact is rejected when it was trained against a different prepared workbook.

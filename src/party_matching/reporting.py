@@ -11,11 +11,7 @@ import xlsxwriter
 from .domain import normalize_name, read_json, read_jsonl, write_json
 
 
-DETAIL_COLUMNS = [
-    "Raw Name", "Correct Answer", "Prediction", "Result", "Confidence", "Reason",
-    "Matched Part", "Candidate Considered", "Connector", "Selection Rule",
-    "Review Issue", "Split", "Part Matches",
-]
+DETAIL_COLUMNS = ["Unverified Party", "Verified Party - Matched", "Verified Party - Label", "Result", "Rules-only prediction"]
 
 
 def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: dict[str, Any]) -> dict[str, Any]:
@@ -23,6 +19,8 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
     manifest = read_json(prepared / "manifest.json", {}) or {}
     labels = {row["adm_party_id"]: row for row in read_jsonl(prepared / "labels.jsonl")}
     decisions = {row["adm_party_id"]: row for row in read_jsonl(output / "decisions.jsonl")}
+    rules_path = output / "rules_decisions.jsonl"
+    rules_decisions = {row["adm_party_id"]: row for row in read_jsonl(rules_path)} if rules_path.exists() else {}
     source_rows = list(read_jsonl(prepared / "source_rows.jsonl"))
     graph_path = run_stats.get("graph_path")
     graph_payload = (read_json(graph_path, {}) or {}) if graph_path else {}
@@ -46,6 +44,8 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
             continue
         label = labels[adm_id]
         decision = decisions[adm_id]
+        rules_decision = rules_decisions.get(adm_id, {})
+        rules_match = rules_decision.get("decision") == "MATCH"
         workbook_canonical_id = label.get("expected_party_id")
         expected, expected_parent_name = global_parent(workbook_canonical_id)
         candidate_id = decision.get("verified_party_id")
@@ -65,6 +65,7 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
             "ADM Party ID": adm_id,
             "Source Row": source_row["source_row"],
             "Dataset Split": split,
+            "Category": label.get("category"),
             "Evaluation Status": (
                 "UNKNOWN" if split == "UNKNOWN" else
                 "LABELED_HELD_OUT" if held_out else
@@ -84,6 +85,8 @@ def build_reports(prepared_dir: str | Path, output_dir: str | Path, run_stats: d
             "Event Emitted": bool(decision.get("emitted")),
             "Predicted Verified ID": predicted,
             "Predicted Verified Name": candidate_name if is_match else None,
+            "Rules-only Verified ID": rules_decision.get("verified_party_id") if rules_match else None,
+            "Rules-only prediction": rules_decision.get("verified_party_name") if rules_match else ("NO_MATCH" if rules_decision else None),
             "Top Candidate Verified ID": candidate_id,
             "Top Candidate Verified Name": candidate_name,
             "Matched Member ID": decision.get("matched_member_id"),
@@ -166,15 +169,18 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
         correct = [row for row in scored_matches if row["prediction"]["Correct"]]
         retrieved = [row for row in scorable if row["prediction"]["Expected Target Retrieved"]]
         interval = _wilson_interval(len(correct), len(scored_matches)) if scored_matches else (None, None)
+        precision = len(correct) / len(scored_matches) if scored_matches else None
+        recall = len(correct) / len(scorable) if scorable else None
         return {
             "rows": len(rows),
             "scorable": len(scorable),
             "matches": len(matches),
             "correct_matches": len(correct),
-            "precision": len(correct) / len(scored_matches) if scored_matches else None,
+            "precision": precision,
             "precision_ci_95_low": interval[0],
             "precision_ci_95_high": interval[1],
-            "recall": len(correct) / len(scorable) if scorable else None,
+            "recall": recall,
+            "f1": 2 * precision * recall / (precision + recall) if precision is not None and recall is not None and precision + recall else None,
             # Backward-compatible alias for any existing consumers of metrics.json.
             "correct_match_recall": len(correct) / len(scorable) if scorable else None,
             "coverage": len(scored_matches) / len(scorable) if scorable else None,
@@ -195,6 +201,10 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
             row for row in held_out
             if case in str(row["prediction"].get("Case Types") or "").split(" | ")
         ])
+    category_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in held_out:
+        category_rows[str(row["prediction"].get("Category") or "(blank)")].append(row)
+    by_category = {category: summarize(category_rows[category]) for category in sorted(category_rows)}
     cohorts = {
         "ALL_HELD_OUT": summarize(held_out),
         "NO_OBO": summarize([row for row in held_out if not row["prediction"]["Has OBO"]]),
@@ -222,9 +232,6 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
             row for row in held_out
             if (row["prediction"]["Has OBO"] or row["prediction"]["Has VIA"])
             and row["prediction"]["Decision"] == "NO_MATCH"
-        ]),
-        "UNIQUE_SHORT_RULE": summarize([
-            row for row in held_out if row["prediction"]["Decision Tier"] == "UNIQUE_SHORT_OFFICIAL"
         ]),
         "PREFERRED_NEAR_CUTOFF": summarize([
             row for row in held_out if row["prediction"]["Reason"] == "PREFERRED_SEGMENT_NEAR_CUTOFF"
@@ -271,8 +278,27 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
         sum(bool(row["prediction"]["Correct"]) for row in rows) / len(rows)
         for rows in canonical_groups.values() if rows
     ]
+    rules_matches = [row for row in held_out if row["prediction"].get("Rules-only Verified ID")]
+    rules_correct = sum(
+        row["prediction"]["Rules-only Verified ID"] == row["prediction"]["Expected Verified ID"]
+        for row in rules_matches
+    )
+    rules_precision = rules_correct / len(rules_matches) if rules_matches else None
+    rules_recall = rules_correct / len(held_out) if held_out else None
     return {
         "overall": summarize(held_out),
+        "rules_only": {
+            "matches": len(rules_matches),
+            "correct_matches": rules_correct,
+            "precision": rules_precision,
+            "recall": rules_recall,
+            "f1": 2 * rules_precision * rules_recall / (rules_precision + rules_recall)
+            if rules_precision is not None and rules_recall is not None and rules_precision + rules_recall else None,
+            "disagreements": sum(
+                row["prediction"].get("Predicted Verified ID") != row["prediction"].get("Rules-only Verified ID")
+                for row in held_out
+            ),
+        },
         "all_labeled": summarize(all_labeled),
         "cohorts": cohorts,
         "by_split": {
@@ -280,6 +306,7 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
             for split in split_names
         },
         "by_case": by_case,
+        "by_category": by_category,
         "funnel": funnel,
         "error_buckets": dict(Counter(row["prediction"]["Error Bucket"] for row in held_out)),
         "macro_entity_recall": sum(entity_recalls) / len(entity_recalls) if entity_recalls else None,
@@ -337,46 +364,75 @@ def _write_workbook(
     grouped.hide_gridlines(2)
     grouped.set_tab_color("#1F4E78")
     grouped.freeze_panes(1, 1)
-    grouped.write_row(0, 0, ["Resolved (Canonical) Name", "# Raw Names", "Raw Aliases (all matched rows)"], header)
+    grouped.write_row(0, 0, [
+        "Verified Party", "Number in dataset", "Unverified Parties",
+        "Number of unverified parties matched", "Number of correct predictions",
+        "Unverified Parties - Ground truth",
+    ], header)
     raw_name_column = manifest.get("raw_name_column")
-    matched_by_party: dict[str, dict[str, Any]] = {}
+    by_party: dict[str, dict[str, Any]] = {}
     for row in rows:
         prediction = row["prediction"]
-        if prediction["Decision"] != "MATCH":
-            continue
-        party_id = str(prediction.get("Predicted Verified ID") or prediction.get("Predicted Verified Name") or "")
-        group = matched_by_party.setdefault(party_id, {
-            "name": str(prediction.get("Predicted Verified Name") or "(unnamed verified party)"),
-            "aliases": [],
-        })
-        group["aliases"].append(str(row["source"].get(raw_name_column) or "(blank raw name)"))
+        raw = str(row["source"].get(raw_name_column) or "(blank raw name)")
+        expected_id = prediction.get("Expected Verified ID")
+        if expected_id and str(prediction.get("Expected Canonical Name") or "").strip().upper() != "UNKNOWN":
+            group = by_party.setdefault(expected_id, {"name": prediction.get("Expected Global Parent Name") or prediction.get("Expected Canonical Name"), "truth": [], "matched": [], "correct": 0})
+            group["truth"].append(raw)
+        if prediction["Decision"] == "MATCH":
+            party_id = prediction.get("Predicted Verified ID")
+            if party_id:
+                group = by_party.setdefault(party_id, {"name": prediction.get("Predicted Verified Name"), "truth": [], "matched": [], "correct": 0})
+                group["matched"].append(raw)
+                group["correct"] += int(bool(prediction.get("Correct")))
     row_number = 1
-    for group in sorted(matched_by_party.values(), key=lambda item: (-len(item["aliases"]), item["name"].casefold())):
-        aliases = " | ".join(group["aliases"])
-        for part, start in enumerate(range(0, len(aliases), 32_000)):
-            grouped.write_string(row_number, 0, group["name"], text)
+    for group in sorted(by_party.values(), key=lambda item: (-len(item["truth"]), -len(item["matched"]), str(item["name"]).casefold())):
+        matched_chunks = _text_chunks(group["matched"])
+        truth_chunks = _text_chunks(group["truth"])
+        for part in range(max(len(matched_chunks), len(truth_chunks), 1)):
             if part == 0:
-                grouped.write_number(row_number, 1, len(group["aliases"]), integer)
-            grouped.write_string(row_number, 2, aliases[start:start + 32_000], text)
+                grouped.write_string(row_number, 0, str(group["name"]), text)
+                grouped.write_number(row_number, 1, len(group["truth"]), integer)
+                grouped.write_number(row_number, 3, len(group["matched"]), integer)
+                grouped.write_number(row_number, 4, group["correct"], integer)
+            if part < len(matched_chunks):
+                grouped.write_string(row_number, 2, matched_chunks[part], text)
+            if part < len(truth_chunks):
+                grouped.write_string(row_number, 5, truth_chunks[part], text)
             row_number += 1
-    grouped.set_row(0, 30)
+    grouped.set_row(0, 38)
     grouped.set_column("A:A", 48)
     grouped.set_column("B:B", 16)
     grouped.set_column("C:C", 110)
+    grouped.set_column("D:E", 24)
+    grouped.set_column("F:F", 110)
     if row_number > 1:
-        grouped.autofilter(0, 0, row_number - 1, 2)
+        grouped.autofilter(0, 0, row_number - 1, 5)
 
     summary = workbook.add_worksheet("Stats")
     summary.hide_gridlines(2)
     summary.set_tab_color("#1F4E78")
     summary.write("A2", "Party matching evaluation", title)
     _section_band(summary, 3, 0, 1, "Run summary", section)
+    _section_band(summary, 3, 3, 8, "Held-out ML versus rules-only", section)
     _section_band(summary, 3, 11, 12, "Matching stage profile", section)
     summary.write_row("A5", ["Metric", "Value"], header)
+    summary.write_row(4, 3, ["Method", "Matches", "Correct", "Precision", "Recall", "F1"], header)
     summary.write_row(4, 11, ["Stage", "Seconds / MB"], header)
     overall = metrics["overall"]
+    for row_number, name, values in ((5, "ML", overall), (6, "Rules only", metrics["rules_only"])):
+        summary.write_string(row_number, 3, name, text)
+        summary.write_number(row_number, 4, values["matches"], integer)
+        summary.write_number(row_number, 5, values["correct_matches"], integer)
+        for column, key in ((6, "precision"), (7, "recall"), (8, "f1")):
+            if values[key] is not None:
+                summary.write_number(row_number, column, values[key], percent)
+    cleaning = manifest.get("cleaning_counts", {})
     summary_values = [
-        ("All source rows", run_stats.get("records"), integer),
+        ("Original workbook rows", manifest.get("rows"), integer),
+        ("Cleaned unverified rows", manifest.get("cleaned_unverified_rows", run_stats.get("records")), integer),
+        ("Exact duplicate rows excluded", cleaning.get("EXACT_DUPLICATE", 0), integer),
+        ("Verified self-rows excluded", cleaning.get("VERIFIED_SELF_ROW", 0), integer),
+        ("Conflicting-label rows excluded", cleaning.get("CONFLICTING_LABELS", 0), integer),
         ("Held-out labeled rows", overall["scorable"], integer),
         ("Held-out matches", overall["matches"], integer),
         ("Held-out correct matches", overall["correct_matches"], integer),
@@ -385,6 +441,7 @@ def _write_workbook(
         ("Precision 95% CI low", overall["precision_ci_95_low"], percent),
         ("Precision 95% CI high", overall["precision_ci_95_high"], percent),
         ("Held-out recall", overall["recall"], percent),
+        ("Held-out F1", overall["f1"], percent),
         ("Held-out macro entity recall", metrics.get("macro_entity_recall"), percent),
         ("Held-out coverage", overall["coverage"], percent),
         ("Held-out retrieval recall", overall["retrieval_recall"], percent),
@@ -393,13 +450,15 @@ def _write_workbook(
         ("Matching runtime (seconds)", run_stats.get("total_seconds"), decimal),
         ("System threshold", run_stats.get("system_threshold"), decimal),
         ("Effective cutoff", run_stats.get("effective_cutoff"), decimal),
-        ("Held-out unique-short matches", metrics["cohorts"]["UNIQUE_SHORT_RULE"]["matches"], integer),
+        ("Rules-only threshold", run_stats.get("rules_system_threshold"), decimal),
+        ("Held-out ML/rules disagreements", metrics["rules_only"]["disagreements"], integer),
         ("Held-out preferred-part abstentions", metrics["cohorts"]["PREFERRED_NEAR_CUTOFF"]["rows"], integer),
     ]
     profile_keys = (
         "graph_seconds", "index_seconds", "retrieval_seconds", "retrieval_query_seconds", "char_matrix_seconds",
         "word_matrix_seconds", "shortlist_seconds", "proposal_build_seconds",
         "identity_feature_seconds", "identity_model_seconds", "decision_seconds",
+        "rules_decision_seconds",
         "write_seconds", "peak_rss_mb",
     )
     for offset in range(max(len(summary_values), len(profile_keys))):
@@ -419,41 +478,52 @@ def _write_workbook(
     summary.set_column("L:L", 32)
     summary.set_column("M:M", 17)
 
-    split_start = 24
-    _section_band(summary, split_start, 0, 8, "Metrics by dataset split", section)
-    split_headers = ["Split", "Rows", "Scorable", "Matches", "Correct", "Precision", "Recall", "Coverage", "Retrieval recall"]
+    split_start = 7 + max(len(summary_values), len(profile_keys))
+    _section_band(summary, split_start, 0, 9, "Metrics by dataset split", section)
+    split_headers = ["Split", "Rows", "Scorable", "Matches", "Correct", "Precision", "Recall", "F1", "Coverage", "Retrieval recall"]
     summary.write_row(split_start + 1, 0, split_headers, header)
     for row_number, (split, values) in enumerate(metrics["by_split"].items(), start=split_start + 2):
         summary.write(row_number, 0, split, text)
         for column, key in enumerate(("rows", "scorable", "matches", "correct_matches"), start=1):
             summary.write(row_number, column, values[key], integer)
-        for column, key in enumerate(("precision", "recall", "coverage", "retrieval_recall"), start=5):
+        for column, key in enumerate(("precision", "recall", "f1", "coverage", "retrieval_recall"), start=5):
             if values[key] is not None:
                 summary.write(row_number, column, values[key], percent)
 
     cohort_start = split_start + 4 + len(metrics["by_split"])
-    _section_band(summary, cohort_start, 0, 8, "Held-out review cohorts", section)
-    summary.write_row(cohort_start + 1, 0, ["Cohort", "Rows", "Scorable", "Matches", "Correct", "Precision", "Recall", "Coverage", "Retrieval recall"], header)
+    _section_band(summary, cohort_start, 0, 9, "Held-out review cohorts", section)
+    summary.write_row(cohort_start + 1, 0, ["Cohort", "Rows", "Scorable", "Matches", "Correct", "Precision", "Recall", "F1", "Coverage", "Retrieval recall"], header)
     for row_number, (cohort, values) in enumerate(metrics["cohorts"].items(), start=cohort_start + 2):
         summary.write(row_number, 0, cohort, text)
         for column, key in enumerate(("rows", "scorable", "matches", "correct_matches"), start=1):
             summary.write(row_number, column, values[key], integer)
-        for column, key in enumerate(("precision", "recall", "coverage", "retrieval_recall"), start=5):
+        for column, key in enumerate(("precision", "recall", "f1", "coverage", "retrieval_recall"), start=5):
             if values[key] is not None:
                 summary.write(row_number, column, values[key], percent)
 
     case_start = cohort_start + 4 + len(metrics["cohorts"])
-    _section_band(summary, case_start, 0, 8, "Metrics by case type", section)
-    summary.write_row(case_start + 1, 0, ["Case type", "Rows", "Scorable", "Matches", "Correct", "Precision", "Recall", "Coverage", "Retrieval recall"], header)
+    _section_band(summary, case_start, 0, 9, "Metrics by case type", section)
+    summary.write_row(case_start + 1, 0, ["Case type", "Rows", "Scorable", "Matches", "Correct", "Precision", "Recall", "F1", "Coverage", "Retrieval recall"], header)
     for row_number, (case, values) in enumerate(metrics["by_case"].items(), start=case_start + 2):
         summary.write(row_number, 0, case, text)
         for column, key in enumerate(("rows", "scorable", "matches", "correct_matches"), start=1):
             summary.write(row_number, column, values[key], integer)
-        for column, key in enumerate(("precision", "recall", "coverage", "retrieval_recall"), start=5):
+        for column, key in enumerate(("precision", "recall", "f1", "coverage", "retrieval_recall"), start=5):
             if values[key] is not None:
                 summary.write(row_number, column, values[key], percent)
 
-    reliability_start = case_start + 4 + len(metrics["by_case"])
+    category_start = case_start + 4 + len(metrics["by_case"])
+    _section_band(summary, category_start, 0, 9, "Metrics by workbook category", section)
+    summary.write_row(category_start + 1, 0, ["Category", "Rows", "Scorable", "Matches", "Correct", "Precision", "Recall", "F1", "Coverage", "Retrieval recall"], header)
+    for row_number, (category, values) in enumerate(metrics["by_category"].items(), start=category_start + 2):
+        summary.write(row_number, 0, category, text)
+        for column, key in enumerate(("rows", "scorable", "matches", "correct_matches"), start=1):
+            summary.write(row_number, column, values[key], integer)
+        for column, key in enumerate(("precision", "recall", "f1", "coverage", "retrieval_recall"), start=5):
+            if values[key] is not None:
+                summary.write(row_number, column, values[key], percent)
+
+    reliability_start = category_start + 4 + len(metrics["by_category"])
     _section_band(summary, reliability_start, 0, 3, "Confidence reliability", section)
     summary.write_row(reliability_start + 1, 0, ["Confidence bucket", "Matches", "Average confidence", "Observed accuracy"], header)
     for row_number, values in enumerate(metrics["confidence_bins"], start=reliability_start + 2):
@@ -470,13 +540,16 @@ def _write_workbook(
         summary.write(row_number, 1, value, integer)
 
     summary.set_column("A:A", 42)
-    summary.set_column("B:E", 14)
-    summary.set_column("F:I", 16)
+    summary.set_column("B:C", 14)
+    summary.set_column("D:D", 19)
+    summary.set_column("E:F", 14)
+    summary.set_column("G:I", 16)
+    summary.set_column("J:J", 16)
     summary.set_row(split_start + 1, 30)
 
     detail = workbook.add_worksheet("Detail")
     detail.hide_gridlines(2)
-    detail.freeze_panes(1, 3)
+    detail.freeze_panes(1, 1)
     detail.write_row(0, 0, DETAIL_COLUMNS, header)
     for row_number, row in enumerate(rows, start=1):
         prediction = row["prediction"]
@@ -491,22 +564,10 @@ def _write_workbook(
         )
         values = [
             row["source"].get(manifest.get("raw_name_column")),
-            correct_answer,
             prediction.get("Predicted Verified Name") if is_match else "NO_MATCH",
+            correct_answer,
             result,
-            prediction.get("Confidence") or None,
-            prediction.get("Reason"),
-            prediction.get("Matched Mention"),
-            None if is_match else (prediction.get("Provisional Verified Name") or prediction.get("Top Candidate Verified Name")),
-            prediction.get("Connector"),
-            (
-                (str(prediction.get("Connector Resolution") or "") + "; unique short name").strip("; ")
-                if prediction.get("Decision Tier") == "UNIQUE_SHORT_OFFICIAL"
-                else prediction.get("Connector Resolution")
-            ),
-            _review_issue(prediction),
-            prediction.get("Dataset Split"),
-            prediction.get("Mention Results"),
+            prediction.get("Rules-only prediction"),
         ]
         for column, value in enumerate(values):
             if isinstance(value, (list, tuple, set)):
@@ -522,19 +583,20 @@ def _write_workbook(
                 detail.write_string(row_number, column, str(value)[:32_767], text)
     detail.autofilter(0, 0, len(rows), len(DETAIL_COLUMNS) - 1)
     detail.set_row(0, 30)
-    for column, width in enumerate((44, 38, 38, 16, 14, 27, 30, 38, 13, 20, 29, 17, 70)):
+    for column, width in enumerate((48, 48, 48, 18, 48)):
         detail.set_column(column, column, width)
     match_format = workbook.add_format({"bg_color": "#E2F0D9", "font_color": "#275D38"})
     no_match_format = workbook.add_format({"bg_color": "#FCE8E6", "font_color": "#9C2F24"})
+    unscored_format = workbook.add_format({"bg_color": "#F2F4F7", "font_color": "#4B5563"})
     if rows:
-        detail.conditional_format(1, 3, len(rows), 3, {
-            "type": "cell", "criteria": "==", "value": '"Correct"', "format": match_format,
+        detail.conditional_format(1, 0, len(rows), 4, {
+            "type": "formula", "criteria": '=$D2="Correct"', "format": match_format,
         })
-        detail.conditional_format(1, 3, len(rows), 3, {
-            "type": "cell", "criteria": "==", "value": '"Wrong match"', "format": no_match_format,
+        detail.conditional_format(1, 0, len(rows), 4, {
+            "type": "formula", "criteria": '=OR($D2="Wrong match",$D2="No match")', "format": no_match_format,
         })
-        detail.conditional_format(1, 3, len(rows), 3, {
-            "type": "cell", "criteria": "==", "value": '"No match"', "format": no_match_format,
+        detail.conditional_format(1, 0, len(rows), 4, {
+            "type": "formula", "criteria": '=$D2="Not scored"', "format": unscored_format,
         })
     workbook.close()
 
@@ -548,6 +610,7 @@ def _write_analysis(path: Path, metrics: dict[str, Any], run_stats: dict[str, An
         f"- Held-out labeled rows: {overall['scorable']}",
         f"- Held-out match precision: {_display_rate(overall['precision'])}",
         f"- Held-out recall: {_display_rate(overall['recall'])}",
+        f"- Held-out F1: {_display_rate(overall['f1'])}",
         f"- Held-out coverage: {_display_rate(overall['coverage'])}",
         f"- Held-out retrieval recall: {_display_rate(overall['retrieval_recall'])}",
         f"- Held-out macro entity recall: {_display_rate(metrics.get('macro_entity_recall'))}",
@@ -574,6 +637,11 @@ def _join(value: Any) -> str:
     return " | ".join(str(item) for item in value)
 
 
+def _text_chunks(values: list[str]) -> list[str]:
+    joined = " | ".join(values)
+    return [joined[start:start + 32_000] for start in range(0, len(joined), 32_000)]
+
+
 def _display_rate(value: float | None) -> str:
     return "n.a." if value is None else f"{value:.2%}"
 
@@ -595,8 +663,6 @@ def _review_issue(prediction: dict[str, Any]) -> str:
         return ""
     if prediction["Reason"] == "PREFERRED_SEGMENT_NEAR_CUTOFF":
         return "Preferred part near cutoff"
-    if prediction["Reason"] == "CONNECTOR_UNCALIBRATED":
-        return "Connector needs calibration"
     if (prediction["Has OBO"] or prediction["Has VIA"]) and prediction["Expected Segment Seen"]:
         return "Wrong connector choice" if prediction["Decision"] == "MATCH" else "Correct part rejected"
     if not prediction["Expected Target Retrieved"]:

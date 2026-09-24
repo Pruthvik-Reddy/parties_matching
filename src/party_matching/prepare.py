@@ -41,25 +41,47 @@ def prepare_workbook(
     account_id = str(config.get("account", {}).get("id", "poc-account"))
 
     clean = frame.where(pd.notna(frame), None)
-    canonical_by_key: dict[str, str] = {}
+    canonical_names: set[str] = set()
     for value in clean[canonical_col].tolist():
-        name = str(value or "").strip()
-        key = normalize_name(name)
-        if key and key != "unknown":
-            canonical_by_key.setdefault(key, name)
-    canonical_values = sorted(canonical_by_key.values(), key=str.casefold)
+        name = str(value or "")
+        if name.strip() and name.strip().casefold() != "unknown":
+            canonical_names.add(name)
+    canonical_values = sorted(canonical_names, key=lambda name: (name.casefold(), name))
     parties = [{
-        "partyId": stable_id("verified", account_id, normalize_name(name)),
+        "partyId": stable_id("verified", account_id, name),
         "partyName": name,
     } for name in canonical_values]
-    party_ids = {normalize_name(item["partyName"]): item["partyId"] for item in parties}
-    verified_references = set(party_ids) | {item["partyId"] for item in parties}
+    party_ids = {item["partyName"]: item["partyId"] for item in parties}
+    verified_references = {normalize_name(name) for name in party_ids} | {item["partyId"] for item in parties}
 
     adm_rows, label_rows, source_rows = [], [], []
     split_counts: Counter[str] = Counter()
-    for offset, row in enumerate(clean.to_dict(orient="records"), start=2):
-        raw_name = str(row.get(raw_col) or "").strip()
-        canonical = str(row.get(canonical_col) or "").strip()
+    cleaning_counts: Counter[str] = Counter()
+    excluded_rows = []
+    source_records = clean.to_dict(orient="records")
+    labels_by_raw: dict[str, set[str]] = {}
+    for row in source_records:
+        raw, canonical = str(row.get(raw_col) or ""), str(row.get(canonical_col) or "")
+        if canonical.strip() and canonical.strip().casefold() != "unknown":
+            labels_by_raw.setdefault(raw, set()).add(canonical)
+    conflicted = {raw for raw, labels in labels_by_raw.items() if len(labels) > 1}
+    first_row_by_pair: dict[tuple[str, str], int] = {}
+    for offset, row in enumerate(source_records, start=2):
+        raw_name = str(row.get(raw_col) or "")
+        canonical = str(row.get(canonical_col) or "")
+        reason = (
+            "CONFLICTING_LABELS" if raw_name in conflicted else
+            "VERIFIED_SELF_ROW" if raw_name == canonical and canonical.strip() and canonical.strip().casefold() != "unknown" else
+            "EXACT_DUPLICATE" if (raw_name, canonical) in first_row_by_pair else None
+        )
+        if reason:
+            cleaning_counts[reason] += 1
+            excluded_rows.append({
+                "source_row": offset, "raw_name": raw_name, "canonical_name": canonical,
+                "reason": reason, "kept_source_row": first_row_by_pair.get((raw_name, canonical)) if reason == "EXACT_DUPLICATE" else None,
+            })
+            continue
+        first_row_by_pair[(raw_name, canonical)] = offset
         category = str(row.get(category_col) or "") if category_col else ""
         adm_id = stable_id("adm", account_id, offset, raw_name)
         parent_id = str(row.get(parent_id_col) or "").strip() if parent_id_col else ""
@@ -70,7 +92,7 @@ def prepare_workbook(
         )
         record_is_verified = _as_bool(row.get(record_verified_col)) if record_verified_col else False
         eligible = not parent_id or not parent_is_verified
-        has_known_label = bool(canonical and canonical.casefold() != "unknown")
+        has_known_label = bool(canonical.strip() and canonical.strip().casefold() != "unknown")
         scorable = has_known_label and eligible
         if not eligible:
             split = "INELIGIBLE"
@@ -92,7 +114,7 @@ def prepare_workbook(
         label_rows.append({
             "adm_party_id": adm_id,
             "expected_canonical_name": canonical or None,
-            "expected_party_id": party_ids.get(normalize_name(canonical)),
+            "expected_party_id": party_ids.get(canonical),
             "category": category or None,
             "split": split,
             "scorable": scorable,
@@ -112,6 +134,11 @@ def prepare_workbook(
     write_jsonl(out / "adm_records.jsonl", adm_rows)
     write_jsonl(out / "labels.jsonl", label_rows)
     write_jsonl(out / "source_rows.jsonl", source_rows)
+    write_jsonl(out / "excluded_rows.jsonl", excluded_rows)
+    write_json(out / "cleaning_report.json", {
+        "source_rows": len(frame), "cleaned_unverified_rows": len(adm_rows),
+        "excluded": dict(cleaning_counts), "conflicting_raw_names": len(conflicted),
+    })
     jobs = []
     for index in range(0, len(parties), 100):
         chunk = parties[index:index + 100]
@@ -128,6 +155,8 @@ def prepare_workbook(
         "source": str(source.resolve()),
         "account_id": account_id,
         "rows": len(frame),
+        "cleaned_unverified_rows": len(adm_rows),
+        "cleaning_counts": dict(cleaning_counts),
         "verified_parties": len(parties),
         "source_columns": list(frame.columns),
         "raw_name_column": raw_col,
@@ -142,6 +171,7 @@ def prepare_workbook(
             "source_hash": source_hash,
             "parties": parties,
             "columns": list(frame.columns),
+            "cleaning_policy": "exact_raw_and_label_v1",
         }),
     }
     write_json(out / "manifest.json", manifest)

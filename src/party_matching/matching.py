@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 import os
 import platform
@@ -61,7 +62,6 @@ TARGET_FEATURES = [
     "identity", "cross_encoder", "has_cross_encoder", "runner_up_identity",
     "identity_margin", "exact", "collision_penalty", "supporting_mentions", "graph_depth",
 ]
-SHORT_NAME_DESCRIPTORS = {"technology", "technologies", "systems", "services", "solutions", "software"}
 
 
 class MentionRetriever:
@@ -255,7 +255,6 @@ class FeatureScorer:
         self.model = self.artifact.get("identity_model")
         self.target_model = self.artifact.get("target_model")
         self.calibrator = self.artifact.get("calibrator")
-        self.connector_models = self.artifact.get("connector_models", {})
         self.timing: dict[str, float] = defaultdict(float)
         self.idf = self.artifact.get("idf", {})
         self.system_threshold = float(self.artifact.get("system_threshold", 0.90))
@@ -280,20 +279,25 @@ class FeatureScorer:
             ], dtype=np.float32)
             self.timing["identity_feature_seconds"] += time.perf_counter() - stage_started
             stage_started = time.perf_counter()
+            rule_scores = np.asarray([rule_identity_score(vector) for vector in vectors])
             if self.model is not None:
                 scores = self.model.predict_proba(vectors)[:, 1]
             else:
-                scores = np.asarray([rule_identity_score(vector) for vector in vectors])
+                scores = rule_scores
             self.timing["identity_model_seconds"] += time.perf_counter() - stage_started
             stage_started = time.perf_counter()
-            for proposal, score in zip(batch, scores):
+            for proposal, score, rule_score in zip(batch, scores, rule_scores):
                 value = float(score)
+                rule_value = float(rule_score)
                 if proposal.candidate_type != "official" and proposal.candidate_confidence is not None:
                     value = min(value, proposal.candidate_confidence)
+                    rule_value = min(rule_value, proposal.candidate_confidence)
                 if proposal.exact and proposal.candidate_collision_count == 1:
                     exact_floor = 0.999 if proposal.candidate_type == "official" else float(proposal.candidate_confidence or 0.0)
                     value = max(value, exact_floor)
+                    rule_value = max(rule_value, exact_floor)
                 proposal.feature_score = value
+                proposal.rules_score = rule_value
             for proposal, vector in zip(batch, vectors):
                 proposal.char_similarity = float(vector[FEATURE_INDEX["char_ratio"]])
                 proposal.jaro_winkler = float(vector[FEATURE_INDEX["jaro_winkler"]])
@@ -370,7 +374,6 @@ def collect_proposals(
     graph: VerifiedGraph,
     retriever: MentionRetriever,
     scorer: FeatureScorer,
-    matching_config: dict[str, Any] | None = None,
 ) -> tuple[dict[str, list[MatchProposal]], dict[str, Any]]:
     queries: list[tuple[str, str, str, str, float | None]] = []
     for party_id in sorted(graph.nodes):
@@ -473,7 +476,6 @@ def collect_proposals(
         proposals,
         batch_size=int(retriever.config.get("identity_batch_size", 50_000)),
     )
-    unique_short_proposals = _mark_unique_short_names(graph, proposals, matching_config or {})
     by_record: dict[str, list[MatchProposal]] = defaultdict(list)
     for proposal in proposals:
         by_record[proposal.adm_party_id].append(proposal)
@@ -482,7 +484,6 @@ def collect_proposals(
         "verified_queries": len(queries),
         "raw_retrieval_hits": raw_hits,
         "scored_proposals": len(proposals),
-        "unique_short_proposals": unique_short_proposals,
         "retrieved_proposals": len(proposals),
         "mentions_with_candidates": len(indexed),
         "root_cap_hits": root_cap_hits,
@@ -501,47 +502,6 @@ def collect_proposals(
         **scorer.timing,
         "embedding_warning": retriever.embedding_warning,
     }
-
-
-def _mark_unique_short_names(
-    graph: VerifiedGraph, proposals: list[MatchProposal], config: dict[str, Any],
-) -> int:
-    if not config.get("unique_short_names", True):
-        return 0
-    minimum = int(config.get("unique_short_min_chars", 7))
-    descriptors = set(config.get("unique_short_descriptors", SHORT_NAME_DESCRIPTORS))
-    eligible: dict[str, set[str]] = defaultdict(set)
-    for node in graph.nodes.values():
-        tokens = base_name(node.party_name).split()
-        if (
-            len(tokens) > 1 and len(tokens[0]) >= minimum
-            and tokens[0].isalpha() and set(tokens[1:]) <= descriptors
-        ):
-            eligible[tokens[0]].add(node.party_id)
-    if not eligible:
-        return 0
-    prefix_roots: dict[str, set[str]] = defaultdict(set)
-    for node in graph.nodes.values():
-        tokens = normalize_name(node.party_name).split()
-        if tokens and tokens[0] in eligible:
-            prefix_roots[tokens[0]].add(graph.root_id(node.party_id))
-    approved: dict[str, str] = {}
-    for prefix, owners in eligible.items():
-        roots = prefix_roots[prefix]
-        if len(roots) != 1:
-            continue
-        root = next(iter(roots))
-        if any(graph.root_id(owner) != root for owner in graph.candidate_owner_ids(prefix)):
-            continue
-        approved.update((owner, prefix) for owner in owners)
-    confidence = min(0.999, max(0.0, float(config.get("unique_short_confidence", 0.985))))
-    marked = 0
-    for proposal in proposals:
-        prefix = approved.get(proposal.owner_party_id) if proposal.candidate_type == "official" else None
-        if prefix and normalize_name(proposal.mention_text) == prefix:
-            proposal.unique_short_confidence = confidence
-            marked += 1
-    return marked
 
 
 def _decide_records_legacy(
@@ -608,9 +568,7 @@ def _decide_records_legacy(
         batch_size=int(matching_cfg.get("confidence_batch_size", 50_000)),
     )
     for score, (context_index, proposal) in zip(target_scores, target_destinations):
-        contexts[context_index]["scored_roots"].append(
-            (max(float(score), proposal.unique_short_confidence or 0.0), proposal)
-        )
+        contexts[context_index]["scored_roots"].append((float(score), proposal))
 
     for context in contexts:
         record = context["record"]
@@ -622,14 +580,7 @@ def _decide_records_legacy(
             item for item in scored_roots
             if not _guard_reason(item[1], matching_cfg)
         ]
-        short_roots = [item for item in eligible_roots if item[1].unique_short_confidence is not None]
-        if short_roots:
-            confidence, winner = max(short_roots, key=lambda item: (item[0], item[1].root_party_id))
-            runner_score, runner = next(
-                ((score, proposal) for score, proposal in eligible_roots if proposal.root_party_id != winner.root_party_id),
-                (0.0, None),
-            )
-        elif eligible_roots:
+        if eligible_roots:
             confidence, winner = eligible_roots[0]
             runner_score, runner = eligible_roots[1] if len(eligible_roots) > 1 else (0.0, None)
         else:
@@ -646,7 +597,7 @@ def _decide_records_legacy(
                 decision_tier=decision_tier,
             )
             continue
-        if runner and margin < minimum_margin and winner.unique_short_confidence is None:
+        if runner and margin < minimum_margin:
             reason = "CANDIDATE_COLLISION" if winner.candidate_collision_count > 1 else "AMBIGUOUS_FINAL_TARGETS"
             completed[record.adm_party_id] = _no_match(
                 record, reason, confidence=confidence, proposal=winner,
@@ -706,16 +657,6 @@ def _decide_records_legacy(
     return [completed[record.adm_party_id] for record in records]
 
 
-def _connector_features(chosen: dict[str, Any], others: list[dict[str, Any]]) -> list[float]:
-    competitor = max(others, key=lambda item: item["confidence"])
-    return [
-        chosen["confidence"], competitor["confidence"],
-        chosen["confidence"] - competitor["confidence"],
-        float(chosen["proposal"].exact), float(competitor["proposal"].exact),
-        float(len(others) + 1),
-    ]
-
-
 def _decide_connectors(
     records: list[PartyRecord],
     proposals_by_record: dict[str, list[MatchProposal]],
@@ -723,8 +664,7 @@ def _decide_connectors(
     scorer: FeatureScorer,
     reranker: CrossEncoderReranker,
     config: dict[str, Any],
-    apply_gate: bool = True,
-) -> tuple[list[FinalDecision], list[tuple[str, str, str, list[float]]]]:
+) -> list[FinalDecision]:
     matching_cfg = config.get("matching", {})
     minimum_margin = float(matching_cfg.get("minimum_root_margin", 0.04))
     contexts: list[dict[str, Any]] = []
@@ -772,12 +712,9 @@ def _decide_connectors(
 
     scores = scorer.score_target_vectors(vectors, batch_size=int(matching_cfg.get("confidence_batch_size", 50_000)))
     for score, (record_index, mention_index, proposal) in zip(scores, destinations):
-        contexts[record_index]["mentions"][mention_index]["scored"].append(
-            (max(float(score), proposal.unique_short_confidence or 0.0), proposal)
-        )
+        contexts[record_index]["mentions"][mention_index]["scored"].append((float(score), proposal))
 
     decisions: list[FinalDecision] = []
-    conflicts: list[tuple[str, str, str, list[float]]] = []
     for context in contexts:
         record = context["record"]
         if context.get("forced_reason"):
@@ -795,10 +732,7 @@ def _decide_connectors(
                 retrieved[proposal.root_party_id] = max(retrieved.get(proposal.root_party_id, 0.0), _combined_identity(proposal))
             scored = sorted(item["scored"], key=lambda value: (-value[0], value[1].root_party_id))
             eligible = [value for value in scored if not _guard_reason(value[1], matching_cfg)]
-            short = [value for value in eligible if value[1].unique_short_confidence is not None]
-            top = max(short, key=lambda value: (value[0], value[1].root_party_id)) if short else (
-                eligible[0] if eligible else (scored[0] if scored else None)
-            )
+            top = eligible[0] if eligible else (scored[0] if scored else None)
             runner = next((value for value in eligible if top and value[1].root_party_id != top[1].root_party_id), None)
             item["top"] = top
             confidence, proposal = top if top else (0.0, None)
@@ -807,7 +741,7 @@ def _decide_connectors(
                 reason = "NO_CANDIDATES"
             elif not eligible:
                 reason = _guard_reason(proposal, matching_cfg) or "INSUFFICIENT_SUPPORT"
-            elif runner and margin < minimum_margin and not short:
+            elif runner and margin < minimum_margin:
                 reason = "AMBIGUOUS_FINAL_TARGETS"
             elif confidence < scorer.system_threshold:
                 reason = "INSUFFICIENT_SUPPORT"
@@ -820,7 +754,6 @@ def _decide_connectors(
                 "root_name": proposal.root_party_name if proposal else None,
                 "matched_candidate": proposal.matched_name if proposal else None,
                 "exact": bool(proposal.exact) if proposal else False,
-                "unique_short_official": bool(proposal.unique_short_confidence) if proposal else False,
                 "runner_up_root_id": runner[1].root_party_id if runner else None,
                 "runner_up_score": runner[0] if runner else None,
                 "margin": margin if proposal else None,
@@ -861,31 +794,13 @@ def _decide_connectors(
             decision.connector_resolution = "NONE"
         else:
             roots = {item["proposal"].root_party_id for item in valid}
-            trusted = False
             if len(roots) == 1:
                 chosen = max(valid, key=lambda item: (item["confidence"], -item["position"]))
                 resolution = "ONLY_MATCH" if len(valid) == 1 else "SAME_ROOT"
-                confidence = chosen["confidence"]
             else:
                 chosen = min(valid, key=lambda item: item["position"]) if connector == "OBO" else max(valid, key=lambda item: item["position"])
                 resolution = f"{connector}_{'LEFT' if connector == 'OBO' else 'RIGHT'}"
-                features = _connector_features(chosen, [item for item in valid if item is not chosen])
-                conflicts.append((record.adm_party_id, connector, chosen["proposal"].root_party_id, features))
-                proposal = chosen["proposal"]
-                trusted = (
-                    chosen["position"] == preferred["position"]
-                    and proposal.unique_short_confidence is not None
-                )
-                model_info = scorer.connector_models.get(connector) if apply_gate and not trusted else None
-                if trusted:
-                    confidence = chosen["confidence"]
-                else:
-                    confidence = (
-                        float(model_info["model"].predict_proba(np.asarray([features], dtype=np.float32))[0, 1])
-                        if model_info else 0.0
-                    )
-                if trusted:
-                    resolution += "_STRONG_NAME"
+            confidence = chosen["confidence"]
             proposal = chosen["proposal"]
             runner = chosen["runner"]
             decision = _no_match(
@@ -897,16 +812,11 @@ def _decide_connectors(
             decision.provisional_party_name = proposal.root_party_name
             decision.selected_mention_position = chosen["position"]
             decision.connector_resolution = resolution
-            if len(roots) > 1 and apply_gate and not trusted and not model_info:
-                decision.reason = "CONNECTOR_UNCALIBRATED"
-            elif len(roots) > 1 and apply_gate and not trusted and confidence < float(model_info["threshold"]):
-                decision.reason = "CONNECTOR_BELOW_CUTOFF"
-            else:
-                decision.decision = "MATCH"
-                decision.graph_path = graph.path_to_root(proposal.owner_party_id)
+            decision.decision = "MATCH"
+            decision.graph_path = graph.path_to_root(proposal.owner_party_id)
         decision.mention_results = mention_results
         decisions.append(decision)
-    return decisions, conflicts
+    return decisions
 
 
 def decide_records(
@@ -921,7 +831,7 @@ def decide_records(
         mentions = parse_mentions(record)
         (connector if len(mentions) > 1 or mentions[0].parse_warning == "MALFORMED_CONNECTOR" else plain).append(record)
     legacy = _decide_records_legacy(plain, proposals_by_record, graph, scorer, reranker, config)
-    resolved, _ = _decide_connectors(connector, proposals_by_record, graph, scorer, reranker, config)
+    resolved = _decide_connectors(connector, proposals_by_record, graph, scorer, reranker, config)
     by_id = {decision.adm_party_id: decision for decision in [*legacy, *resolved]}
     return [by_id[record.adm_party_id] for record in records]
 
@@ -995,7 +905,7 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
         artifact_dir / "cross_encoder",
         rerank_mode,
     )
-    proposals, retrieval_stats = collect_proposals(graph, retriever, scorer, config.get("matching", {}))
+    proposals, retrieval_stats = collect_proposals(graph, retriever, scorer)
     decision_started = time.perf_counter()
     decisions = decide_records(matchable, proposals, graph, scorer, reranker, config)
     decision_seconds = time.perf_counter() - decision_started
@@ -1023,6 +933,41 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
         if decision.decision == "MATCH" and decision.confidence < decision_cutoff:
             decision.decision = "NO_MATCH"
             decision.reason = "BELOW_REQUEST_CUTOFF"
+
+    rules_started = time.perf_counter()
+    rules_scorer = copy.copy(scorer)
+    rules_scorer.model = None
+    rules_scorer.target_model = None
+    rules_scorer.calibrator = None
+    rules_scorer.system_threshold = float(scorer.artifact.get(
+        "rules_system_threshold", config.get("decision", {}).get("fallback_system_threshold", 0.90),
+    ))
+    for record_proposals in proposals.values():
+        for proposal in record_proposals:
+            proposal.feature_score = proposal.rules_score
+            proposal.cross_encoder_score = None
+    rules_by_id = {
+        decision.adm_party_id: decision for decision in decide_records(
+            matchable, proposals, graph, rules_scorer,
+            CrossEncoderReranker(artifact_dir / "cross_encoder", "off"), config,
+        )
+    }
+    for record in records:
+        if record.adm_party_id not in rules_by_id:
+            rules_by_id[record.adm_party_id] = FinalDecision(
+                account_id=account_id, adm_party_id=record.adm_party_id, raw_name=record.raw_name,
+                decision="NO_MATCH", confidence=0.0,
+                reason="INELIGIBLE_PARENT_VERIFIED" if not record.eligible else "ALREADY_MAPPED",
+            )
+    rules_decisions = [rules_by_id[record.adm_party_id] for record in records]
+    for decision in rules_decisions:
+        event_job = party_job.get(str(decision.matched_member_id or decision.verified_party_id), default_job)
+        decision_cutoff = max(rules_scorer.system_threshold, float(event_job.get("confidenceCutoff", 0.0)))
+        if decision.decision == "MATCH" and decision.confidence < decision_cutoff:
+            decision.decision = "NO_MATCH"
+            decision.reason = "BELOW_REQUEST_CUTOFF"
+    rules_decision_seconds = time.perf_counter() - rules_started
+
     events: list[dict[str, Any]] = []
     for update in graph_updates:
         root_id = graph.root_id(update["child_id"])
@@ -1067,6 +1012,7 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
         })
     write_started = time.perf_counter()
     write_jsonl(output / "decisions.jsonl", (decision.to_dict() for decision in decisions))
+    write_jsonl(output / "rules_decisions.jsonl", (decision.to_dict() for decision in rules_decisions))
     write_jsonl(output / "events.jsonl", events)
     if new_mappings and not fresh_state:
         existing = list(read_jsonl(mapping_path)) if mapping_path.exists() else []
@@ -1083,9 +1029,13 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
         "events": len(events),
         "effective_cutoff": effective_cutoff,
         "system_threshold": scorer.system_threshold,
+        "rules_system_threshold": rules_scorer.system_threshold,
         "strategy": effective_strategy,
         "requested_strategy": strategy,
         "cross_encoder_mode": rerank_mode,
+        "identity_scorer": "trained_model" if scorer.model is not None else "fallback_rules",
+        "target_scorer": "trained_model" if scorer.target_model is not None else "fallback_formula",
+        "confidence_calibration": "isotonic" if scorer.calibrator is not None else "none",
         "model_version": str(scorer.artifact.get("model_version", "fallback-rules-v2")),
         "model_warning": scorer.load_warning,
         "expansion_version": str(config.get("expansion", {}).get("version", "v1")),
@@ -1096,6 +1046,7 @@ def run_matching(config: dict[str, Any], output_dir: str | Path, fresh_state: bo
         "index_seconds": index_seconds,
         "index_rss_mb": index_rss_mb,
         "decision_seconds": decision_seconds,
+        "rules_decision_seconds": rules_decision_seconds,
         "decision_rss_mb": decision_rss_mb,
         "write_seconds": write_seconds,
         "peak_rss_mb": max((value for value in (
@@ -1136,6 +1087,7 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
             "calibrator": None,
             "idf": _token_idf(party_names),
             "system_threshold": threshold,
+            "rules_system_threshold": threshold,
             "identity_features": IDENTITY_FEATURES,
             "target_features": TARGET_FEATURES,
             "training_pairs": 0,
@@ -1155,6 +1107,7 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
             "calibration_records": 0,
             "calibration_method": "none",
             "system_threshold": threshold,
+            "rules_system_threshold": threshold,
             "cross_encoder": f"skipped: scikit-learn unavailable ({SKLEARN_ERROR})",
         }
         write_json(artifact_dir / "training_report.json", report)
@@ -1217,6 +1170,11 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
         canonical_vectorizer, canonical_index, identity_model, idf,
         char_vectorizer, word_vectorizer, retrieval_cfg,
     )
+    _, rules_threshold_decisions = _build_target_examples(
+        threshold_rows, records, party_names, party_ids,
+        canonical_vectorizer, canonical_index, None, idf,
+        char_vectorizer, word_vectorizer, retrieval_cfg,
+    )
     target_model = None
     if target_examples and len({label for _, label in target_examples}) > 1:
         target_model = LogisticRegression(max_iter=500, class_weight="balanced", random_state=seed)
@@ -1252,6 +1210,8 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
     available_decisions = len(decision_examples)
     minimum_emitted = min(requested_minimum, max(5, available_decisions // 2))
     threshold = _select_threshold(decision_examples, precision_target, fallback, minimum_emitted)
+    rules_examples = _rescore_decision_examples(rules_threshold_decisions, None)
+    rules_threshold = _select_threshold(rules_examples, precision_target, fallback, minimum_emitted)
     cross_encoder_status = "disabled"
     if bool(config.get("training", {}).get("train_cross_encoder", False)):
         cross_encoder_status = _train_cross_encoder(config, pair_rows, artifact_dir / "cross_encoder")
@@ -1261,6 +1221,7 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
         "calibrator": calibrator,
         "idf": idf,
         "system_threshold": threshold,
+        "rules_system_threshold": rules_threshold,
         "identity_features": IDENTITY_FEATURES,
         "target_features": TARGET_FEATURES,
         "training_pairs": len(pair_rows),
@@ -1270,11 +1231,6 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
         "data_version": data_version,
         "cross_encoder_enabled": cross_encoder_status == "trained",
     }
-    joblib.dump(artifact, artifact_dir / "matcher.joblib")
-    connector_models, connector_report = _train_connector_models(
-        config, records, calibration_rows, parties, artifact_dir / "matcher.joblib", data_version,
-    )
-    artifact["connector_models"] = connector_models
     joblib.dump(artifact, artifact_dir / "matcher.joblib")
     report = {
         "training_pairs": len(pair_rows),
@@ -1286,80 +1242,11 @@ def train_models(config: dict[str, Any]) -> dict[str, Any]:
         "threshold_records": len(threshold_rows),
         "calibration_method": calibration_method,
         "system_threshold": threshold,
+        "rules_system_threshold": rules_threshold,
         "cross_encoder": cross_encoder_status,
-        "connector_calibration": connector_report,
     }
     write_json(artifact_dir / "training_report.json", report)
     return report
-
-
-def _train_connector_models(
-    config: dict[str, Any], records: dict[str, PartyRecord], labels: list[dict[str, Any]],
-    parties: list[dict[str, Any]], artifact_path: Path, data_version: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Calibrate positional conflicts from disjoint, actually retrieved connector rows."""
-    minimum = int(config.get("matching", {}).get("connector_min_calibration_rows", 100))
-    selected = [
-        records[row["adm_party_id"]] for row in labels
-        if row.get("scorable") and row.get("expected_party_id") and row["adm_party_id"] in records
-        and len(parse_mentions(records[row["adm_party_id"]])) > 1
-        and len({part.connector_before for part in parse_mentions(records[row["adm_party_id"]]) if part.connector_before}) == 1
-    ]
-    report: dict[str, Any] = {kind: {"calibration_conflicts": 0, "status": "insufficient_data"} for kind in ("OBO", "VIA")}
-    counts = Counter(next(part.connector_before for part in parse_mentions(record) if part.connector_before)
-                     for record in selected)
-    for kind in ("OBO", "VIA"):
-        report[kind]["labeled_connector_rows"] = counts[kind]
-    eligible_kinds = {kind for kind in ("OBO", "VIA") if counts[kind] >= minimum}
-    selected = [record for record in selected
-                if any(part.connector_before in eligible_kinds for part in parse_mentions(record))]
-    if not selected:
-        return {}, report
-    account = selected[0].account_id
-    graph = VerifiedGraph(account, artifact_path.parent / "_calibration_graph_unused.json", load_existing=False)
-    graph.add_parties(parties)
-    retriever = MentionRetriever(selected, config.get("retrieval", {}), workers=int(config.get("execution", {}).get("workers", 1)))
-    scorer = FeatureScorer(artifact_path, data_version)
-    proposals, _ = collect_proposals(graph, retriever, scorer, config.get("matching", {}))
-    rerank_mode = (str(config.get("matching", {}).get("cross_encoder_mode", "ambiguous"))
-                   if scorer.artifact.get("cross_encoder_enabled", False) else "off")
-    _, conflicts = _decide_connectors(selected, proposals, graph, scorer,
-                                       CrossEncoderReranker(artifact_path.parent / "cross_encoder", rerank_mode),
-                                       config, apply_gate=False)
-    expected = {row["adm_party_id"]: graph.root_id(row["expected_party_id"]) for row in labels
-                if row.get("expected_party_id") in graph.nodes}
-    models: dict[str, Any] = {}
-    min_emitted = int(config.get("matching", {}).get("connector_min_threshold_matches", 20))
-    target = float(config.get("decision", {}).get("precision_target", 0.98))
-    for kind in ("OBO", "VIA"):
-        rows = [(adm_id, features, int(root_id == expected.get(adm_id)))
-                for adm_id, connector, root_id, features in conflicts if connector == kind and adm_id in expected]
-        fit_rows = [row for row in rows if int(row[0].replace("-", "")[:8], 16) % 10 < 7]
-        cutoff_rows = [row for row in rows if int(row[0].replace("-", "")[:8], 16) % 10 >= 7]
-        info = report[kind] = {"calibration_conflicts": len(rows), "fit_rows": len(fit_rows),
-                                "threshold_rows": len(cutoff_rows), "status": "insufficient_data"}
-        if len(rows) < minimum or len(cutoff_rows) < min_emitted or len({row[2] for row in fit_rows}) < 2:
-            continue
-        model = LogisticRegression(max_iter=500)
-        model.fit(np.asarray([row[1] for row in fit_rows], dtype=np.float32),
-                  np.asarray([row[2] for row in fit_rows], dtype=np.int8))
-        probabilities = model.predict_proba(np.asarray([row[1] for row in cutoff_rows], dtype=np.float32))[:, 1]
-        ranked = sorted(zip(probabilities, (row[2] for row in cutoff_rows)), reverse=True)
-        chosen_threshold = None
-        correct = 0
-        for index, (probability, outcome) in enumerate(ranked, start=1):
-            correct += outcome
-            next_probability = ranked[index][0] if index < len(ranked) else None
-            if probability != next_probability and index >= min_emitted and correct / index >= target:
-                chosen_threshold = float(probability)
-        if chosen_threshold is None:
-            info["status"] = "precision_target_not_met"
-            continue
-        models[kind] = {"model": model, "threshold": chosen_threshold}
-        emitted = [(probability, outcome) for probability, outcome in ranked if probability >= chosen_threshold]
-        info.update({"status": "ready", "threshold": chosen_threshold, "emitted": len(emitted),
-                     "observed_precision": sum(outcome for _, outcome in emitted) / len(emitted)})
-    return models, report
 
 
 def pair_features(
@@ -1552,9 +1439,8 @@ def distinctive_token_conflict(
 
 
 def _combined_identity(proposal: MatchProposal) -> float:
-    value = (proposal.feature_score if proposal.cross_encoder_score is None else
-             0.55 * proposal.feature_score + 0.45 * proposal.cross_encoder_score)
-    return max(value, proposal.unique_short_confidence or 0.0)
+    return (proposal.feature_score if proposal.cross_encoder_score is None else
+            0.55 * proposal.feature_score + 0.45 * proposal.cross_encoder_score)
 
 
 def _best_per_root(proposals: list[MatchProposal]) -> dict[str, MatchProposal]:
@@ -1567,8 +1453,6 @@ def _best_per_root(proposals: list[MatchProposal]) -> dict[str, MatchProposal]:
 
 
 def _match_method(proposal: MatchProposal) -> str:
-    if proposal.unique_short_confidence is not None:
-        return "rule:unique_short_official"
     if proposal.exact:
         return "exact:normalized"
     if proposal.cross_encoder_score is not None:
@@ -1583,8 +1467,6 @@ def _match_method(proposal: MatchProposal) -> str:
 
 
 def _decision_tier(proposal: MatchProposal, config: dict[str, Any]) -> str:
-    if proposal.unique_short_confidence is not None:
-        return "UNIQUE_SHORT_OFFICIAL"
     if proposal.exact and proposal.candidate_type == "official":
         return "EXACT_OFFICIAL"
     if proposal.exact:
@@ -1725,7 +1607,7 @@ def _build_target_examples(
     party_ids: list[str],
     vectorizer: TfidfVectorizer,
     index: NearestNeighbors,
-    identity_model: Any,
+    identity_model: Any | None,
     idf: dict[str, float],
     char_vectorizer: TfidfVectorizer | None,
     word_vectorizer: TfidfVectorizer | None,
@@ -1750,7 +1632,10 @@ def _build_target_examples(
         candidate_groups.append((label, candidate_ids))
         pairs.extend((record.raw_name, expected_by_id[candidate_id]) for candidate_id in candidate_ids)
     vectors = _training_pair_matrix(pairs, idf, char_vectorizer, word_vectorizer, retrieval_config)
-    identity_scores = identity_model.predict_proba(vectors)[:, 1]
+    identity_scores = (
+        identity_model.predict_proba(vectors)[:, 1] if identity_model is not None
+        else np.asarray([rule_identity_score(vector) for vector in vectors])
+    )
     examples, decisions = [], []
     offset = 0
     for label, candidate_ids in candidate_groups:

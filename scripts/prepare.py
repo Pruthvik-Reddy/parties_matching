@@ -22,9 +22,12 @@ def main() -> None:
         parser.error("provide --workbook or --sample")
     output = Path(args.output or config.get("paths", {}).get("prepared_dir", "data/prepared"))
     manifest = prepare_workbook(workbook, output, config)
-    print(f"Prepared {manifest['rows']:,} rows and {manifest['verified_parties']:,} verified parties in {output.resolve()}")
+    print(
+        f"Prepared {manifest['cleaned_unverified_rows']:,} unverified rows from "
+        f"{manifest['rows']:,} source rows and {manifest['verified_parties']:,} verified parties "
+        f"in {output.resolve()}"
+    )
 
 
 if __name__ == "__main__":
     main()
-

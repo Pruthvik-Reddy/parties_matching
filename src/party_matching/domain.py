@@ -180,6 +180,7 @@ class MatchProposal:
     rrf_score: float = 0.0
     embedding_score: float | None = None
     feature_score: float = 0.0
+    rules_score: float = 0.0
     cross_encoder_score: float | None = None
     candidate_collision_count: int = 1
     char_similarity: float = 0.0
@@ -190,7 +191,6 @@ class MatchProposal:
     candidate_coverage: float = 0.0
     distinctive_token_conflict: bool = False
     digit_conflict: bool = False
-    unique_short_confidence: float | None = None
 
 
 @dataclass

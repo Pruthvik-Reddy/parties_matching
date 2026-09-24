@@ -46,8 +46,6 @@ ann_backend = "usearch" # usearch | brute
 
 [matching]
 connector_policy = "positional" # positional | legacy
-connector_min_calibration_rows = 100
-connector_min_threshold_matches = 20
 strategy = "selective_hybrid" # feature | selective_hybrid
 cross_encoder_mode = "ambiguous" # off | ambiguous | all_shortlisted
 cross_encoder_model = "cross-encoder/ms-marco-MiniLM-L6-v2"
@@ -57,10 +55,6 @@ ambiguous_margin = 0.08
 rerank_top_k = 5
 minimum_root_margin = 0.04
 confidence_batch_size = 50000
-unique_short_names = true
-unique_short_min_chars = 7
-unique_short_confidence = 0.985 # heuristic rule score; review held-out precision
-unique_short_descriptors = ["technology", "technologies", "systems", "services", "solutions", "software"]
 preferred_near_cutoff_band = 0.03
 distinctive_token_guard = true
 digit_conflict_guard = true
