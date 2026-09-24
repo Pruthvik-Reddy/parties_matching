@@ -49,12 +49,12 @@ class ConnectorPreferenceTests(unittest.TestCase):
             IdentityScorer(plain_threshold), NoReranker(), self.config,
         )[0]
 
-    def test_distinct_roots_choose_right_for_obo_and_left_for_via(self):
+    def test_distinct_roots_choose_left_for_obo_and_via(self):
         for plain_threshold in (None, 0.80):  # Primary and rules-only paths.
             with self.subTest(connector="OBO", plain_threshold=plain_threshold):
                 decision = self.decide("OBO", 0.95, 0.90, plain_threshold)
                 self.assertEqual((decision.decision, decision.verified_party_id, decision.connector_resolution),
-                                 ("MATCH", "right", "OBO_RIGHT"))
+                                 ("MATCH", "left", "OBO_LEFT"))
             with self.subTest(connector="VIA", plain_threshold=plain_threshold):
                 decision = self.decide("VIA", 0.90, 0.95, plain_threshold)
                 self.assertEqual((decision.decision, decision.verified_party_id, decision.connector_resolution),
@@ -62,11 +62,17 @@ class ConnectorPreferenceTests(unittest.TestCase):
 
     def test_near_cutoff_guard_follows_new_preferred_side(self):
         for plain_threshold in (None, 0.80):
-            for connector, left_score, right_score in (("OBO", 0.95, 0.79), ("VIA", 0.79, 0.95)):
+            for connector, left_score, right_score in (("OBO", 0.79, 0.95), ("VIA", 0.79, 0.95)):
                 with self.subTest(connector=connector, plain_threshold=plain_threshold):
                     decision = self.decide(connector, left_score, right_score, plain_threshold)
                     self.assertEqual((decision.decision, decision.reason),
                                      ("NO_MATCH", "PREFERRED_SEGMENT_NEAR_CUTOFF"))
+
+    def test_obo_uses_right_only_if_left_has_no_plausible_match(self):
+        for plain_threshold in (None, 0.80):
+            decision = self.decide("OBO", 0.40, 0.95, plain_threshold)
+            self.assertEqual((decision.decision, decision.verified_party_id,
+                              decision.connector_resolution), ("MATCH", "right", "ONLY_MATCH"))
 
 
 if __name__ == "__main__":

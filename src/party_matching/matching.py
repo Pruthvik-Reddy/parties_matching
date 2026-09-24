@@ -780,7 +780,10 @@ def _decide_connectors(
                 best_rejected = (confidence, proposal)
         retrieved_roots = [root for root, _ in sorted(retrieved.items(), key=lambda item: (-item[1], item[0]))]
         connector = context["connector"]
-        preferred_index = len(mention_results) - 1 if connector == "OBO" else 0
+        # Both connector policies currently prefer the leftmost mention when
+        # distinct verified roots are valid. Keep the near-cutoff veto tied to
+        # that same preferred mention rather than falling through to the right.
+        preferred_index = 0
         preferred = mention_results[preferred_index]
         band = max(0.0, float(matching_cfg.get("preferred_near_cutoff_band", 0.03)))
         if (
@@ -811,8 +814,8 @@ def _decide_connectors(
                 chosen = max(valid, key=lambda item: (item["confidence"], -item["position"]))
                 resolution = "ONLY_MATCH" if len(valid) == 1 else "SAME_ROOT"
             else:
-                chosen = max(valid, key=lambda item: item["position"]) if connector == "OBO" else min(valid, key=lambda item: item["position"])
-                resolution = f"{connector}_{'RIGHT' if connector == 'OBO' else 'LEFT'}"
+                chosen = min(valid, key=lambda item: item["position"])
+                resolution = f"{connector}_LEFT"
             confidence = chosen["confidence"]
             proposal = chosen["proposal"]
             runner = chosen["runner"]

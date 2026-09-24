@@ -8,7 +8,7 @@ from party_matching.graph import VerifiedGraph
 from party_matching.matching import FeatureScorer
 from party_matching.reporting import _write_rules_changes
 from party_matching.rules_enhancement import (
-    _root_token_index, _unique_short_name, _unsafe_removed,
+    _anchored_official_prefix, _root_token_index, _unique_short_name, _unsafe_removed,
     enhance_rules_decisions, name_views, soft_token_coverage,
 )
 
@@ -66,6 +66,43 @@ class EnhancedRulesTests(unittest.TestCase):
     def test_brandlike_suffix_is_unsafe(self):
         self.assertTrue(_unsafe_removed("SpringCM", "cooper", [], {}))
         self.assertFalse(_unsafe_removed("Partner", "carahsoft", [], {}))
+
+    def test_complete_official_name_prefix_not_just_shared_prefix(self):
+        self.assertEqual(
+            _anchored_official_prefix("Ingram Micro Inc. LATAM Export Division", "Ingram Micro Inc."),
+            ("Ingram Micro Inc", "LATAM Export Division"),
+        )
+        self.assertIsNone(_anchored_official_prefix("Ingram Micro Marketplace", "Ingram Micro Inc."))
+        self.assertIsNone(_anchored_official_prefix("Carahsoft", "Carahsoft Technology Corp."))
+
+    def test_core_anchor_supplements_existing_enhancement_and_vetoes_competitor(self):
+        self.graph.add_parties([
+            {"partyId": "ingram", "partyName": "Ingram Micro Inc."},
+            {"partyId": "seal", "partyName": "Seal Software Limited"},
+        ])
+        old = PartyRecord("account", "old", "Carahsoft Technology - Partner", 1)
+        core = PartyRecord("account", "core", "Ingram Micro Inc. LATAM Export Division", 2)
+        conflict = PartyRecord("account", "conflict",
+                               "Cooper Holdings, Inc. as successor to Seal Software Limited", 3)
+        proposals = {
+            "old": [self.proposal("old", old.raw_name, "carahsoft", "Carahsoft Technology Corp.")],
+            "core": [self.proposal("core", core.raw_name, "ingram", "Ingram Micro Inc.")],
+            "conflict": [self.proposal("conflict", conflict.raw_name, "cooper", "Cooper Holdings, Inc."),
+                         self.proposal("conflict", conflict.raw_name, "seal", "Seal Software Limited")],
+        }
+        baseline = [self.rejected("old", old.raw_name, "carahsoft", "Carahsoft Technology Corp."),
+                    self.rejected("core", core.raw_name, "ingram", "Ingram Micro Inc."),
+                    self.rejected("conflict", conflict.raw_name, "cooper", "Cooper Holdings, Inc.")]
+        result, stats = enhance_rules_decisions(
+            [old, core, conflict], proposals, baseline, self.graph,
+            SimpleNamespace(char_vectorizer=None, word_vectorizer=None),
+            self.scorer, self.config, {}, {"confidenceCutoff": 0.0},
+        )
+        self.assertEqual([item.decision for item in result], ["MATCH", "MATCH", "NO_MATCH"])
+        self.assertEqual(result[0].decision_tier, "RULES_SAFE_VIEW_FIRST_SEGMENT")
+        self.assertEqual(result[1].decision_tier, "RULES_SAFE_VIEW_CORE_ANCHOR")
+        self.assertEqual(stats["core_anchor_matches"], 1)
+        self.assertEqual(stats["unsafe_core_anchors_skipped"], 1)
 
     def test_only_rejected_plain_rows_are_enhanced(self):
         carahsoft = PartyRecord("account", "raw-c", "Carahsoft Technology - Partner", 1)

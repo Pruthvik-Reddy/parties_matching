@@ -328,6 +328,14 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
     )
     rules_precision = rules_correct / len(rules_matches) if rules_matches else None
     rules_recall = rules_correct / len(held_out) if held_out else None
+    pre_core_matches = [row for row in rules_matches
+                        if row["prediction"].get("Rules-only Decision Tier") != "RULES_SAFE_VIEW_CORE_ANCHOR"]
+    pre_core_correct = sum(
+        row["prediction"]["Rules-only Verified ID"] == row["prediction"]["Expected Verified ID"]
+        for row in pre_core_matches
+    )
+    pre_core_precision = pre_core_correct / len(pre_core_matches) if pre_core_matches else None
+    pre_core_recall = pre_core_correct / len(held_out) if held_out else None
     prior_rules_matches = [row for row in held_out if row["prediction"].get("Prior Rules Verified ID")]
     prior_rules_correct = sum(
         row["prediction"]["Prior Rules Verified ID"] == row["prediction"]["Expected Verified ID"]
@@ -364,6 +372,13 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
                 row["prediction"].get("Predicted Verified ID") != row["prediction"].get("Rules-only Verified ID")
                 for row in held_out
             ),
+            "before_core_anchor": {
+                "matches": len(pre_core_matches), "correct_matches": pre_core_correct,
+                "precision": pre_core_precision, "recall": pre_core_recall,
+                "f1": 2 * pre_core_precision * pre_core_recall / (pre_core_precision + pre_core_recall)
+                if pre_core_precision is not None and pre_core_recall is not None
+                and pre_core_precision + pre_core_recall else None,
+            },
             "prior_rules": {
                 "matches": len(prior_rules_matches), "correct_matches": prior_rules_correct,
                 "precision": prior_rules_precision, "recall": prior_rules_recall,
@@ -508,8 +523,9 @@ def _write_workbook(
     for row_number, name, values in (
         (5, "ML", overall),
         (6, "Rules only - enhanced", metrics["rules_only"]),
-        (7, "Rules only - previous", metrics["rules_only"]["prior_rules"]),
-        (8, "Rules only - no containment", metrics["rules_only"]["baseline_without_containment"]),
+        (7, "Rules only - before core anchor", metrics["rules_only"]["before_core_anchor"]),
+        (8, "Rules only - previous", metrics["rules_only"]["prior_rules"]),
+        (9, "Rules only - no containment", metrics["rules_only"]["baseline_without_containment"]),
     ):
         summary.write_string(row_number, 3, name, text)
         summary.write_number(row_number, 4, values["matches"], integer)
@@ -546,6 +562,7 @@ def _write_workbook(
         ("Enhanced rules enabled", "yes" if run_stats.get("rules_enhanced_enabled") else "no", text),
         ("Enhanced rules short-name matches", (run_stats.get("rules_enhancement") or {}).get("short_name_matches"), integer),
         ("Enhanced rules safe-view matches", (run_stats.get("rules_enhancement") or {}).get("safe_view_matches"), integer),
+        ("Enhanced rules core-anchor matches", (run_stats.get("rules_enhancement") or {}).get("core_anchor_matches"), integer),
         ("Rules containment enabled", "yes" if run_stats.get("rules_containment_enabled") else "no", text),
         ("Rules-only containment floor", run_stats.get("rules_containment_min_confidence"), decimal),
         ("Rules containment calibration matches", metrics["rules_only"]["containment"]["calibration"]["matches"], integer),

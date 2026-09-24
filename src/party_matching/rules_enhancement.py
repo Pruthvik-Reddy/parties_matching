@@ -153,6 +153,123 @@ def _pair_cosines(proposals: list[MatchProposal], vectorizer: Any) -> np.ndarray
     return np.asarray(left.multiply(right).sum(axis=1)).ravel().astype(np.float32)
 
 
+def _anchored_official_prefix(raw_name: str, official_name: str) -> tuple[str, str] | None:
+    """Find a complete official name at the start, followed by extra context."""
+    official_tokens = normalize_name(official_name).split()
+    informative = [token for token in official_tokens if token not in LEGAL_SUFFIXES | FUNCTION_WORDS]
+    if len(informative) < 2 and not (
+        len(informative) == 1 and len(informative[0]) >= 8
+        and any(token in LEGAL_SUFFIXES for token in official_tokens)
+    ):
+        return None
+    normalized_official = " ".join(official_tokens)
+    for word in re.finditer(r"[^\W_]+", raw_name, flags=re.UNICODE):
+        prefix = raw_name[:word.end()]
+        normalized_prefix = normalize_name(prefix)
+        if normalized_prefix == normalized_official:
+            remainder = raw_name[word.end():].strip(" \t.,:;-/–—|()")
+            return (prefix, remainder) if len(normalize_name(remainder)) >= 2 else None
+        if len(normalized_prefix.split()) > len(official_tokens) + 2:
+            break
+    return None
+
+
+def _unsafe_anchor_remainder(
+    remainder: str, chosen_root: str, proposals: list[MatchProposal], idf: dict[str, float],
+) -> bool:
+    if _unsafe_removed(remainder, chosen_root, proposals, idf):
+        return True
+    # A full competing official name inside a longer suffix can be diluted in
+    # whole-suffix coverage (e.g. "as successor to Acme Software Limited").
+    suffix = normalize_name(remainder)
+    for item in proposals:
+        if item.root_party_id == chosen_root or item.candidate_type != "official":
+            continue
+        words = [token for token in normalize_name(item.matched_name).split()
+                 if token not in LEGAL_SUFFIXES | FUNCTION_WORDS]
+        if len(words) >= 2 and f" {' '.join(words)} " in f" {suffix} ":
+            return True
+    return False
+
+
+def _recover_core_anchors(
+    records: list[PartyRecord], proposals_by_record: dict[str, list[MatchProposal]],
+    enhanced: dict[str, FinalDecision], graph: Any, retriever: Any, scorer: Any,
+    config: dict[str, Any], party_job: dict[str, dict], default_job: dict,
+) -> tuple[int, int, int]:
+    """Supplement, but never replace, matches accepted by the existing rules."""
+    from .matching import CrossEncoderReranker, decide_records
+
+    pending: list[tuple[PartyRecord, list[MatchProposal]]] = []
+    blocked = 0
+    for record in records:
+        previous = enhanced[record.adm_party_id]
+        if previous.decision != "NO_MATCH" or not previous.verified_party_id:
+            continue
+        mentions = parse_mentions(record)
+        if len(mentions) != 1 or mentions[0].parse_warning or (previous.margin or 0.0) < 0.08:
+            continue
+        original = proposals_by_record.get(record.adm_party_id, [])
+        owner = sorted(
+            (item for item in original if item.root_party_id == previous.verified_party_id
+             and item.candidate_type == "official" and item.candidate_collision_count == 1),
+            key=lambda item: (-len(normalize_name(item.matched_name)), -item.feature_score),
+        )[:2]
+        clones = []
+        for index, item in enumerate(owner):
+            anchored = _anchored_official_prefix(record.raw_name, item.matched_name)
+            if anchored is None:
+                continue
+            prefix, remainder = anchored
+            if _unsafe_anchor_remainder(remainder, previous.verified_party_id, original, scorer.idf):
+                blocked += 1
+                continue
+            clone = copy.copy(item)
+            clone.mention_id = f"{record.adm_party_id}:rules_core:{index}"
+            clone.mention_text = prefix
+            clone.retrieval_sources = [*item.retrieval_sources, "rules_view:core_anchor"]
+            clone.cross_encoder_score = None
+            clone.embedding_score = None
+            clone.rrf_score = 0.0
+            clones.append(clone)
+        if clones:
+            pending.append((record, clones))
+
+    scored = accepted = 0
+    reranker = CrossEncoderReranker("unused-rules-core-model", "off")
+    for start in range(0, len(pending), 250):
+        batch = pending[start:start + 250]
+        clones = [clone for _, items in batch for clone in items]
+        scored += len(clones)
+        chars = _pair_cosines(clones, retriever.char_vectorizer)
+        words = _pair_cosines(clones, retriever.word_vectorizer)
+        for item, char_score, word_score in zip(clones, chars, words):
+            item.char_tfidf_score = float(char_score)
+            item.word_tfidf_score = float(word_score)
+            item.lexical_score = max(float(char_score), float(word_score))
+            item.exact = float(normalize_name(item.mention_text) == normalize_name(item.matched_name))
+        scorer.score_proposals(clones)
+        augmented = {record.adm_party_id: [*proposals_by_record[record.adm_party_id], *items]
+                     for record, items in batch}
+        decisions = decide_records([record for record, _ in batch], augmented, graph, scorer, reranker, config)
+        for decision in decisions:
+            previous = enhanced[decision.adm_party_id]
+            if decision.decision != "MATCH" or decision.verified_party_id != previous.verified_party_id:
+                continue
+            if not any(item.adm_party_id == decision.adm_party_id
+                       and item.mention_text == decision.matched_mention
+                       and item.matched_name == decision.matched_candidate_name for item in clones):
+                continue
+            job = party_job.get(str(decision.matched_member_id or decision.verified_party_id), default_job)
+            if decision.confidence < max(scorer.plain_threshold, float(job.get("confidenceCutoff", 0.0))):
+                continue
+            decision.decision_tier = "RULES_SAFE_VIEW_CORE_ANCHOR"
+            decision.match_method = "rules:safe_view_core_anchor"
+            enhanced[decision.adm_party_id] = decision
+            accepted += 1
+    return scored, accepted, blocked
+
+
 def enhance_rules_decisions(
     records: list[PartyRecord], proposals_by_record: dict[str, list[MatchProposal]],
     baseline_decisions: list[FinalDecision], graph: Any, retriever: Any,
@@ -255,7 +372,11 @@ def enhance_rules_decisions(
             decision.match_method = f"rules:safe_view_{kind}"
             enhanced[decision.adm_party_id] = decision
             view_matches += 1
+    core_scored, core_matches, core_blocked = _recover_core_anchors(
+        records, proposals_by_record, enhanced, graph, retriever, scorer, config, party_job, default_job,
+    )
     result = [enhanced[item.adm_party_id] for item in records]
     return result, {"reviewed_plain_no_matches": reviewed, "view_candidates_scored": view_candidates,
                     "unsafe_views_skipped": unsafe_views, "short_name_matches": short_matches,
-                    "safe_view_matches": view_matches}
+                    "safe_view_matches": view_matches, "core_anchor_candidates_scored": core_scored,
+                    "core_anchor_matches": core_matches, "unsafe_core_anchors_skipped": core_blocked}
