@@ -99,7 +99,8 @@ class ConnectorPreferenceTests(unittest.TestCase):
             ))
         config = {"matching": {"connector_policy": "positional", "cross_encoder_mode": "off"},
                   "decision": {"rules_enhanced_enabled": True,
-                               "rules_connector_short_name_enabled": True}}
+                               "rules_connector_short_name_enabled": True,
+                               "rules_multiword_prefix_enabled": True}}
         rules = decide_records([record], {record.adm_party_id: proposals}, graph,
                                IdentityScorer(0.8), NoReranker(), config)[0]
         ml = decide_records([record], {record.adm_party_id: proposals}, graph,
@@ -137,6 +138,55 @@ class ConnectorPreferenceTests(unittest.TestCase):
         decision = decide_records([record], {record.adm_party_id: proposals}, graph,
                                   IdentityScorer(0.8), NoReranker(), config)[0]
         self.assertEqual((decision.decision, decision.verified_party_id), ("MATCH", "right"))
+
+    def test_multiword_short_name_recovers_only_a_unique_verified_root(self):
+        graph = VerifiedGraph("account", "unused-graph.json", load_existing=False)
+        graph.add_parties([
+            {"partyId": "ingram-inc", "partyName": "Ingram Micro Inc."},
+            {"partyId": "customer", "partyName": "Example Customer LLC"},
+        ])
+        record = PartyRecord("account", "connector-multi", "Ingram Micro OBO Example Customer LLC", 3)
+        proposals = []
+        for mention, root_id, official, score, lexical in zip(
+            parse_mentions(record), ("ingram-inc", "customer"),
+            ("Ingram Micro Inc.", "Example Customer LLC"),
+            (0.69, 0.99), (0.60, 1.0),
+        ):
+            proposals.append(MatchProposal(
+                adm_party_id=record.adm_party_id, mention_id=mention.mention_id,
+                mention_text=mention.text, connector_before=mention.connector_before,
+                connector_after=mention.connector_after, owner_party_id=root_id,
+                owner_party_name=official, root_party_id=root_id,
+                root_party_name=official, matched_name=official,
+                candidate_type="official", candidate_source="verified",
+                candidate_confidence=None, feature_score=score,
+                char_tfidf_score=lexical,
+            ))
+        config = {"matching": {"connector_policy": "positional", "cross_encoder_mode": "off"},
+                  "decision": {"rules_enhanced_enabled": True,
+                               "rules_connector_short_name_enabled": True,
+                               "rules_multiword_prefix_enabled": True}}
+        unique = decide_records([record], {record.adm_party_id: proposals}, graph,
+                                IdentityScorer(0.8), NoReranker(), config)[0]
+        self.assertEqual((unique.decision, unique.verified_party_id), ("MATCH", "ingram-inc"))
+        self.assertEqual(unique.decision_tier, "RULES_ROOT_UNIQUE_CONNECTOR_PREFIX")
+        config["decision"]["rules_multiword_prefix_enabled"] = False
+        previous = decide_records([record], {record.adm_party_id: proposals}, graph,
+                                  IdentityScorer(0.8), NoReranker(), config)[0]
+        self.assertEqual((previous.decision, previous.verified_party_id), ("MATCH", "customer"))
+        config["decision"]["rules_multiword_prefix_enabled"] = True
+        ml = decide_records([record], {record.adm_party_id: proposals}, graph,
+                            IdentityScorer(None), NoReranker(), config)[0]
+        self.assertEqual((ml.decision, ml.verified_party_id), ("MATCH", "customer"))
+        graph.add_parties([{"partyId": "ingram-other", "partyName": "Ingram Micro"}])
+        ambiguous = decide_records([record], {record.adm_party_id: proposals}, graph,
+                                   IdentityScorer(0.8), NoReranker(), config)[0]
+        self.assertEqual((ambiguous.decision, ambiguous.reason),
+                         ("NO_MATCH", "AMBIGUOUS_PREFERRED_VERIFIED_NAME"))
+        graph.nodes["ingram-other"].parent_id = "ingram-inc"
+        linked = decide_records([record], {record.adm_party_id: proposals}, graph,
+                                IdentityScorer(0.8), NoReranker(), config)[0]
+        self.assertEqual((linked.decision, linked.verified_party_id), ("MATCH", "ingram-inc"))
 
 
 if __name__ == "__main__":

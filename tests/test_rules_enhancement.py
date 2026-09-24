@@ -8,7 +8,7 @@ from party_matching.graph import VerifiedGraph
 from party_matching.matching import FeatureScorer
 from party_matching.reporting import _write_rules_changes
 from party_matching.rules_enhancement import (
-    _anchored_official_prefix, _root_token_index, _unique_short_name, _unsafe_removed,
+    _anchored_official_prefix, _root_prefix_index, _root_token_index, _unique_short_name, _unsafe_removed,
     enhance_rules_decisions, name_views, soft_token_coverage,
 )
 
@@ -58,10 +58,24 @@ class EnhancedRulesTests(unittest.TestCase):
         baseline = self.rejected("raw", record.raw_name, "carahsoft", name, 0.692)
         proposals = [self.proposal("raw", record.raw_name, "carahsoft", name)]
         self.assertIsNotNone(_unique_short_name(record, baseline, proposals,
-                                                 _root_token_index(self.graph), 0.0))
+                                                 _root_token_index(self.graph), {}, 0.0))
         self.graph.add_parties([{"partyId": "other", "partyName": "Carahsoft Europe"}])
         self.assertIsNone(_unique_short_name(record, baseline, proposals,
-                                              _root_token_index(self.graph), 0.0))
+                                              _root_token_index(self.graph), {}, 0.0))
+
+    def test_multiword_short_name_requires_one_verified_root(self):
+        self.graph.add_parties([{"partyId": "ingram-inc", "partyName": "Ingram Micro Inc."}])
+        record = PartyRecord("account", "ingram-raw", "Ingram Micro", 1)
+        name = "Ingram Micro Inc."
+        baseline = self.rejected(record.adm_party_id, record.raw_name, "ingram-inc", name)
+        proposals = [self.proposal(record.adm_party_id, record.raw_name, "ingram-inc", name)]
+        prefixes = _root_prefix_index(self.graph, {record.raw_name})
+        self.assertIsNotNone(_unique_short_name(record, baseline, proposals,
+                                                 _root_token_index(self.graph), prefixes, 0.0))
+        self.graph.add_parties([{"partyId": "ingram-other", "partyName": "Ingram Micro"}])
+        prefixes = _root_prefix_index(self.graph, {record.raw_name})
+        self.assertIsNone(_unique_short_name(record, baseline, proposals,
+                                              _root_token_index(self.graph), prefixes, 0.0))
 
     def test_brandlike_suffix_is_unsafe(self):
         self.assertTrue(_unsafe_removed("SpringCM", "cooper", [], {}))

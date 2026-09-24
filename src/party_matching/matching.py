@@ -684,13 +684,18 @@ def _decide_connectors(
     # This is an enhanced-rules recovery only. The ML decisions and the
     # ordinary connector policy continue to use the existing cutoff.
     short_name_enabled = (
-        scorer.plain_threshold is not None
+        bool(records)
+        and scorer.plain_threshold is not None
         and bool(decision_cfg.get("rules_enhanced_enabled", False))
         and bool(decision_cfg.get("rules_connector_short_name_enabled", False))
     )
     if short_name_enabled:
-        from .rules_enhancement import _root_token_index, _unique_official_short_token
+        from .rules_enhancement import _root_prefix_index, _root_token_index, _unique_official_short_name
         root_tokens = _root_token_index(graph)
+        allow_multiword = bool(decision_cfg.get("rules_multiword_prefix_enabled", False))
+        root_prefixes = _root_prefix_index(
+            graph, {mention.text for record in records for mention in parse_mentions(record)},
+        ) if allow_multiword else {}
         short_floor = float(decision_cfg.get("rules_containment_min_confidence", 0.40))
         short_margin = float(decision_cfg.get("rules_containment_min_margin", 0.08))
         short_lexical = float(decision_cfg.get("rules_containment_min_lexical", 0.50))
@@ -768,7 +773,9 @@ def _decide_connectors(
                 short_name_enabled and proposal is not None and eligible
                 and confidence < scorer.system_threshold
                 and confidence >= short_floor and margin >= short_margin
-                and _unique_official_short_token(mention.text, proposal, root_tokens, short_lexical)
+                and _unique_official_short_name(
+                    mention.text, proposal, root_tokens, root_prefixes, short_lexical, allow_multiword,
+                )
             )
             if proposal is None:
                 reason = "NO_CANDIDATES"
@@ -790,7 +797,12 @@ def _decide_connectors(
                 "runner_up_root_id": runner[1].root_party_id if runner else None,
                 "runner_up_score": runner[0] if runner else None,
                 "margin": margin if proposal else None,
-                "decision_tier": "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME" if short_name_match and reason == "MATCH" else None,
+                "decision_tier": (
+                    "RULES_ROOT_UNIQUE_CONNECTOR_PREFIX"
+                    if short_name_match and reason == "MATCH" and len(normalize_name(mention.text).split()) > 1
+                    else "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME" if short_name_match and reason == "MATCH"
+                    else None
+                ),
             }
             mention_results.append(result)
             if reason == "MATCH":
@@ -806,6 +818,29 @@ def _decide_connectors(
         # that same preferred mention rather than falling through to the right.
         preferred_index = 0
         preferred = mention_results[preferred_index]
+        preferred_top = context["mentions"][preferred_index]["top"]
+        preferred_proposal = preferred_top[1] if preferred_top else None
+        preferred_prefix = normalize_name(preferred["text"])
+        # A multiword stem shared by separate verified roots is not an
+        # inferable alias. Do not choose the other connector segment merely
+        # because this preferred segment fell below the ordinary cutoff.
+        if (
+            short_name_enabled and allow_multiword and valid
+            and not any(item["position"] == preferred["position"] for item in valid)
+            and len(preferred_prefix.split()) >= 2
+            and len(root_prefixes.get(preferred_prefix, set())) > 1
+            and preferred_proposal is not None
+            and preferred_proposal.candidate_type == "official"
+            and max(preferred_proposal.char_tfidf_score, preferred_proposal.word_tfidf_score) >= short_lexical
+        ):
+            decision = _no_match(
+                record, "AMBIGUOUS_PREFERRED_VERIFIED_NAME", preferred["confidence"],
+                proposal=preferred_proposal, retrieved_roots=retrieved_roots,
+            )
+            decision.connector_resolution = "PREFERRED_NAME_AMBIGUOUS"
+            decision.mention_results = mention_results
+            decisions.append(decision)
+            continue
         band = max(0.0, float(matching_cfg.get("preferred_near_cutoff_band", 0.03)))
         if (
             valid and not any(item["position"] == preferred["position"] for item in valid)
@@ -847,7 +882,11 @@ def _decide_connectors(
                 decision_tier=chosen["decision_tier"] or _decision_tier(proposal, matching_cfg),
             )
             if chosen["decision_tier"]:
-                decision.match_method = "rules:root_unique_connector_short_name"
+                decision.match_method = (
+                    "rules:root_unique_connector_prefix"
+                    if chosen["decision_tier"] == "RULES_ROOT_UNIQUE_CONNECTOR_PREFIX"
+                    else "rules:root_unique_connector_short_name"
+                )
             decision.provisional_party_id = proposal.root_party_id
             decision.provisional_party_name = proposal.root_party_name
             decision.selected_mention_position = chosen["position"]
@@ -1013,7 +1052,10 @@ def run_matching(
     rules_decisions = [rules_by_id[record.adm_party_id] for record in records]
     for decision in rules_decisions:
         event_job = party_job.get(str(decision.matched_member_id or decision.verified_party_id), default_job)
-        if decision.decision_tier in {"RULES_UNIQUE_CONTAINMENT", "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME"}:
+        if decision.decision_tier in {
+            "RULES_UNIQUE_CONTAINMENT", "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME",
+            "RULES_ROOT_UNIQUE_CONNECTOR_PREFIX",
+        }:
             rules_cutoff = min(rules_scorer.plain_threshold, containment_floor)
         elif decision.connector is None and decision.connector_resolution is None:
             rules_cutoff = rules_scorer.plain_threshold
@@ -1125,9 +1167,19 @@ def run_matching(
             for decision in rules_decisions
         ),
         "rules_connector_short_name_enabled": bool(config.get("decision", {}).get("rules_connector_short_name_enabled", False)),
+        "rules_multiword_prefix_enabled": bool(config.get("decision", {}).get("rules_multiword_prefix_enabled", False)),
         "rules_connector_short_name_matches": sum(
-            decision.decision == "MATCH" and decision.decision_tier == "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME"
+            decision.decision == "MATCH" and decision.decision_tier in {
+                "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME", "RULES_ROOT_UNIQUE_CONNECTOR_PREFIX",
+            }
             for decision in rules_decisions
+        ),
+        "rules_connector_multiword_matches": sum(
+            decision.decision == "MATCH" and decision.decision_tier == "RULES_ROOT_UNIQUE_CONNECTOR_PREFIX"
+            for decision in rules_decisions
+        ),
+        "rules_connector_ambiguous_prefix_abstentions": sum(
+            decision.reason == "AMBIGUOUS_PREFERRED_VERIFIED_NAME" for decision in rules_decisions
         ),
         "strategy": effective_strategy,
         "requested_strategy": strategy,

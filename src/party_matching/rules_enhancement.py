@@ -1,7 +1,8 @@
-"""Conservative plain-name rules recovery, independent of the trained ML path.
+"""Conservative rules recovery, independent of the trained ML path.
 
-Only previously rejected plain records are reconsidered. No labels are read,
-and a view may only strengthen a verified root retrieved for the full name.
+Only previously rejected plain records are reconsidered by the view stage.
+The official-name uniqueness helpers also serve connector decisions. No labels
+are read, and a view may only strengthen a root retrieved for the full name.
 """
 
 from __future__ import annotations
@@ -122,43 +123,74 @@ def _root_token_index(graph: Any) -> dict[str, set[str]]:
     return roots
 
 
-def _unique_official_short_token(
+def _root_prefix_index(graph: Any, names: set[str]) -> dict[str, set[str]]:
+    """Index only queried official prefixes, not every possible graph n-gram."""
+    wanted = {normalized for name in names if len((normalized := normalize_name(name)).split()) >= 2}
+    roots: dict[str, set[str]] = defaultdict(set)
+    if not wanted:
+        return roots
+    for party_id, node in graph.nodes.items():
+        tokens = normalize_name(node.party_name).split()
+        root_id = graph.root_id(party_id)
+        for length in range(2, len(tokens) + 1):
+            prefix = " ".join(tokens[:length])
+            if prefix in wanted:
+                roots[prefix].add(root_id)
+    return roots
+
+
+def _unique_official_short_name(
     mention_text: str, proposal: MatchProposal, root_tokens: dict[str, set[str]],
-    minimum_lexical: float,
+    root_prefixes: dict[str, set[str]], minimum_lexical: float, allow_multiword: bool = True,
 ) -> bool:
-    """A single distinctive token must identify one verified root, not an alias."""
+    """A short official-name prefix must identify one verified root, not an alias."""
     tokens = normalize_name(mention_text).split()
-    if len(tokens) != 1 or len(tokens[0]) < 5:
+    if not tokens or proposal.candidate_type != "official":
         return False
-    token = tokens[0]
+    official = normalize_name(proposal.matched_name).split()
+    if len(tokens) == 1:
+        if (len(tokens[0]) < 5 or root_tokens.get(tokens[0]) != {proposal.root_party_id}
+                or tokens[0] not in official):
+            return False
+    else:
+        if not allow_multiword:
+            return False
+        if proposal.candidate_collision_count != 1 or official[:len(tokens)] != tokens:
+            return False
+        # A complete multiword stem may omit only a short legal/descriptive
+        # ending. All verified nodes sharing the stem must resolve to one root.
+        if len("".join(tokens)) < 8 or len(official) - len(tokens) > 2:
+            return False
+        if root_prefixes.get(" ".join(tokens)) != {proposal.root_party_id}:
+            return False
     return (
-        root_tokens.get(token) == {proposal.root_party_id}
-        and proposal.candidate_type == "official"
-        and token in normalize_name(proposal.matched_name).split()
-        and max(proposal.char_tfidf_score, proposal.word_tfidf_score) >= minimum_lexical
+        max(proposal.char_tfidf_score, proposal.word_tfidf_score) >= minimum_lexical
     )
 
 
 def _unique_short_name(
     record: PartyRecord, baseline: FinalDecision, proposals: list[MatchProposal],
-    root_tokens: dict[str, set[str]], request_cutoff: float,
+    root_tokens: dict[str, set[str]], root_prefixes: dict[str, set[str]], request_cutoff: float,
+    allow_multiword: bool = True, multiword_floor: float = 0.0,
 ) -> FinalDecision | None:
-    tokens = normalize_name(record.raw_name).split()
-    if len(tokens) != 1 or len(tokens[0]) < 5 or baseline.verified_party_id is None:
-        return None
-    token = tokens[0]
-    if root_tokens.get(token) != {baseline.verified_party_id}:
+    multiword = len(normalize_name(record.raw_name).split()) > 1
+    if baseline.verified_party_id is None or (multiword and baseline.reason != "INSUFFICIENT_SUPPORT"):
         return None
     if baseline.margin is None or baseline.margin < 0.08 or baseline.confidence < request_cutoff:
         return None
+    if multiword and baseline.confidence < multiword_floor:
+        return None
     matching = [item for item in proposals if item.root_party_id == baseline.verified_party_id
-                and _unique_official_short_token(record.raw_name, item, root_tokens, 0.50)]
+                and (not multiword or (not item.digit_conflict and not item.distinctive_token_conflict))
+                and _unique_official_short_name(
+                    record.raw_name, item, root_tokens, root_prefixes, 0.50, allow_multiword,
+                )]
     if not matching:
         return None
     winner = copy.copy(baseline)
     winner.decision = winner.reason = "MATCH"
-    winner.decision_tier = "RULES_ROOT_UNIQUE_SHORT_NAME"
-    winner.match_method = "rules:root_unique_short_name"
+    winner.decision_tier = "RULES_ROOT_UNIQUE_OFFICIAL_PREFIX" if multiword else "RULES_ROOT_UNIQUE_SHORT_NAME"
+    winner.match_method = "rules:root_unique_official_prefix" if multiword else "rules:root_unique_short_name"
     return winner
 
 
@@ -298,7 +330,12 @@ def enhance_rules_decisions(
     baseline = {item.adm_party_id: item for item in baseline_decisions}
     enhanced = dict(baseline)
     root_tokens = _root_token_index(graph)
-    reviewed = view_candidates = short_matches = view_matches = unsafe_views = 0
+    allow_multiword = bool(config.get("decision", {}).get("rules_multiword_prefix_enabled", False))
+    root_prefixes = _root_prefix_index(
+        graph, {record.raw_name for record in records
+                if baseline[record.adm_party_id].decision == "NO_MATCH"},
+    ) if allow_multiword else {}
+    reviewed = view_candidates = short_matches = multiword_short_matches = view_matches = unsafe_views = 0
     pending: list[tuple[PartyRecord, list[tuple[str, str, str]]]] = []
     for record in records:
         original = baseline[record.adm_party_id]
@@ -310,10 +347,14 @@ def enhance_rules_decisions(
         reviewed += 1
         job = party_job.get(str(original.matched_member_id or original.verified_party_id), default_job)
         short = _unique_short_name(record, original, proposals_by_record[record.adm_party_id],
-                                   root_tokens, float(job.get("confidenceCutoff", 0.0)))
+                                   root_tokens, root_prefixes, float(job.get("confidenceCutoff", 0.0)),
+                                   allow_multiword, float(config.get("decision", {}).get(
+                                       "rules_containment_min_confidence", 0.40,
+                                   )))
         if short is not None:
             enhanced[record.adm_party_id] = short
             short_matches += 1
+            multiword_short_matches += int(short.decision_tier == "RULES_ROOT_UNIQUE_OFFICIAL_PREFIX")
             continue
         views = name_views(record.raw_name)
         if views:
@@ -395,5 +436,6 @@ def enhance_rules_decisions(
     result = [enhanced[item.adm_party_id] for item in records]
     return result, {"reviewed_plain_no_matches": reviewed, "view_candidates_scored": view_candidates,
                     "unsafe_views_skipped": unsafe_views, "short_name_matches": short_matches,
+                    "multiword_short_name_matches": multiword_short_matches,
                     "safe_view_matches": view_matches, "core_anchor_candidates_scored": core_scored,
                     "core_anchor_matches": core_matches, "unsafe_core_anchors_skipped": core_blocked}
