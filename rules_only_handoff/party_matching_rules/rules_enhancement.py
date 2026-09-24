@@ -112,13 +112,12 @@ def _unsafe_removed(removed: str, candidate_root: str, proposals: list[MatchProp
     return False
 
 
-def _root_token_index(graph: Any) -> dict[str, set[str]]:
+def _root_token_index(catalog: Any) -> dict[str, set[str]]:
     roots: dict[str, set[str]] = defaultdict(set)
-    for party_id, node in graph.nodes.items():
-        root = graph.root_id(party_id)
-        for token in normalize_name(node.party_name).split():
+    for party_id, party in catalog.parties.items():
+        for token in normalize_name(party.party_name).split():
             if len(token) >= 5 and token not in LEGAL_SUFFIXES | FUNCTION_WORDS:
-                roots[token].add(root)
+                roots[token].add(party_id)
     return roots
 
 
@@ -211,7 +210,7 @@ def _unsafe_anchor_remainder(
 
 def _recover_core_anchors(
     records: list[PartyRecord], proposals_by_record: dict[str, list[MatchProposal]],
-    enhanced: dict[str, FinalDecision], graph: Any, retriever: Any, scorer: Any,
+    enhanced: dict[str, FinalDecision], catalog: Any, retriever: Any, scorer: Any,
     config: dict[str, Any], party_job: dict[str, dict], default_job: dict,
 ) -> tuple[int, int, int]:
     """Supplement, but never replace, matches accepted by the existing rules."""
@@ -268,7 +267,7 @@ def _recover_core_anchors(
         scorer.score_proposals(clones)
         augmented = {record.adm_party_id: [*proposals_by_record[record.adm_party_id], *items]
                      for record, items in batch}
-        decisions = decide_records([record for record, _ in batch], augmented, graph, scorer, reranker, config)
+        decisions = decide_records([record for record, _ in batch], augmented, catalog, scorer, reranker, config)
         for decision in decisions:
             previous = enhanced[decision.adm_party_id]
             if decision.decision != "MATCH" or decision.verified_party_id != previous.verified_party_id:
@@ -289,7 +288,7 @@ def _recover_core_anchors(
 
 def enhance_rules_decisions(
     records: list[PartyRecord], proposals_by_record: dict[str, list[MatchProposal]],
-    baseline_decisions: list[FinalDecision], graph: Any, retriever: Any,
+    baseline_decisions: list[FinalDecision], catalog: Any, retriever: Any,
     scorer: Any, config: dict[str, Any], party_job: dict[str, dict], default_job: dict,
 ) -> tuple[list[FinalDecision], dict[str, Any]]:
     """Recover guarded plain-name matches; preserve every baseline MATCH and connector."""
@@ -297,7 +296,7 @@ def enhance_rules_decisions(
 
     baseline = {item.adm_party_id: item for item in baseline_decisions}
     enhanced = dict(baseline)
-    root_tokens = _root_token_index(graph)
+    root_tokens = _root_token_index(catalog)
     reviewed = view_candidates = short_matches = view_matches = unsafe_views = 0
     pending: list[tuple[PartyRecord, list[tuple[str, str, str]]]] = []
     for record in records:
@@ -365,7 +364,7 @@ def enhance_rules_decisions(
                 item.lexical_score = max(float(char_score), float(word_score))
                 item.exact = float(normalize_name(item.mention_text) == normalize_name(item.matched_name))
             scorer.score_proposals(scoring)
-        decisions = decide_records([item[0] for item in batch], augmented, graph, scorer, reranker, config)
+        decisions = decide_records([item[0] for item in batch], augmented, catalog, scorer, reranker, config)
         for decision in decisions:
             if decision.decision != "MATCH" or decision.matched_mention == decision.raw_name:
                 continue
@@ -390,7 +389,7 @@ def enhance_rules_decisions(
             enhanced[decision.adm_party_id] = decision
             view_matches += 1
     core_scored, core_matches, core_blocked = _recover_core_anchors(
-        records, proposals_by_record, enhanced, graph, retriever, scorer, config, party_job, default_job,
+        records, proposals_by_record, enhanced, catalog, retriever, scorer, config, party_job, default_job,
     )
     result = [enhanced[item.adm_party_id] for item in records]
     return result, {"reviewed_plain_no_matches": reviewed, "view_candidates_scored": view_candidates,

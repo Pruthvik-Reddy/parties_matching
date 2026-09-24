@@ -13,7 +13,7 @@ from sparse_dot_topn import sp_matmul_topn
 from .domain import (FinalDecision, LEGAL_SUFFIXES, MatchProposal,
                      OrganizationMention, PartyRecord, base_name, compact_name,
                      normalize_name, parse_mentions)
-from .graph import VerifiedGraph
+from .catalog import VerifiedCatalog
 
 SKLEARN_ERROR = None
 IDENTITY_FEATURES = [
@@ -199,13 +199,13 @@ class MentionRetriever:
 
 
 def collect_proposals(
-    graph: VerifiedGraph,
+    catalog: VerifiedCatalog,
     retriever: MentionRetriever,
     scorer: FeatureScorer,
 ) -> tuple[dict[str, list[MatchProposal]], dict[str, Any]]:
     queries: list[tuple[str, str, str, str, float | None]] = []
-    for party_id in sorted(graph.nodes):
-        for name, candidate_type, source, candidate_confidence in graph.variants(party_id):
+    for party_id in sorted(catalog.parties):
+        for name, candidate_type, source, candidate_confidence in catalog.variants(party_id):
             if normalize_name(name):
                 queries.append((party_id, name, candidate_type, source, candidate_confidence))
     started = time.perf_counter()
@@ -227,7 +227,8 @@ def collect_proposals(
         by_root = shortlists[mention_index]
         for query_index, evidence in hits.items():
             party_id, query_name, candidate_type, source, candidate_confidence = queries[query_index]
-            root_id = graph.root_id(party_id)
+            # The verified catalog is flat: every alias maps to its own party.
+            root_id = party_id
             exact = float(evidence["exact"])
             lexical = float(evidence["lexical"])
             char_score = float(evidence["char"])
@@ -267,14 +268,14 @@ def collect_proposals(
     for mention_index, by_root in shortlists.items():
         mention = retriever.mentions[mention_index]
         for root_id, variants in by_root.items():
-            root = graph.nodes[root_id]
+            root = catalog.parties[root_id]
             for pending in variants.values():
                 (
                     _, party_id, query_name, candidate_type, source,
                     candidate_confidence, retrieval_sources, exact,
                     lexical, char_score, word_score, rrf_score, embedding,
                 ) = pending
-                owner = graph.nodes[party_id]
+                owner = catalog.parties[party_id]
                 proposals.append(MatchProposal(
                     adm_party_id=mention.adm_party_id,
                     mention_id=mention.mention_id,
@@ -289,7 +290,7 @@ def collect_proposals(
                     candidate_type=candidate_type,
                     candidate_source=source,
                     candidate_confidence=candidate_confidence,
-                    candidate_collision_count=graph.candidate_collision_count(query_name),
+                    candidate_collision_count=catalog.candidate_collision_count(query_name),
                     retrieval_sources=retrieval_sources,
                     exact=exact,
                     lexical_score=lexical,
@@ -335,7 +336,7 @@ def collect_proposals(
 def _decide_records_legacy(
     records: list[PartyRecord],
     proposals_by_record: dict[str, list[MatchProposal]],
-    graph: VerifiedGraph,
+    catalog: VerifiedCatalog,
     scorer: FeatureScorer,
     reranker: CrossEncoderReranker,
     config: dict[str, Any],
@@ -386,7 +387,7 @@ def _decide_records_legacy(
         second_identity = _combined_identity(identity_order[1]) if len(identity_order) > 1 else 0.0
         for position, proposal in enumerate(identity_order):
             other_identity = second_identity if position == 0 else best_identity
-            depth = len(graph.path_to_root(proposal.owner_party_id))
+            depth = 1  # no parent hierarchy in the handoff matcher
             target_vectors.append(target_features(
                 proposal, other_identity, root_support[proposal.root_party_id], depth,
             ))
@@ -440,7 +441,7 @@ def _decide_records_legacy(
             context["plain"] and scorer.plain_threshold is not None
             and bool(config.get("decision", {}).get("rules_containment_enabled", False))
             and confidence < threshold
-            and _rules_containment_evidence(winner, scorer.idf, len(graph.nodes), margin, config)
+            and _rules_containment_evidence(winner, scorer.idf, len(catalog.parties), margin, config)
         )
         if containment:
             threshold = min(threshold, float(config["decision"].get("rules_containment_min_confidence", 0.40)))
@@ -452,7 +453,6 @@ def _decide_records_legacy(
                 decision_tier=decision_tier,
             )
             continue
-        path = graph.path_to_root(winner.owner_party_id)
         if containment:
             decision_tier = "RULES_UNIQUE_CONTAINMENT"
         completed[record.adm_party_id] = FinalDecision(
@@ -490,7 +490,6 @@ def _decide_records_legacy(
             runner_up_party_id=runner.root_party_id if runner else None,
             runner_up_score=runner_score if runner else None,
             margin=margin,
-            graph_path=path,
             retrieved_root_ids=retrieved_roots,
             parse_warning=parse_warning,
         )
@@ -500,7 +499,7 @@ def _decide_records_legacy(
 def _decide_connectors(
     records: list[PartyRecord],
     proposals_by_record: dict[str, list[MatchProposal]],
-    graph: VerifiedGraph,
+    catalog: VerifiedCatalog,
     scorer: FeatureScorer,
     reranker: CrossEncoderReranker,
     config: dict[str, Any],
@@ -517,7 +516,7 @@ def _decide_connectors(
     )
     if short_name_enabled:
         from .rules_enhancement import _root_token_index, _unique_official_short_token
-        root_tokens = _root_token_index(graph)
+        root_tokens = _root_token_index(catalog)
         short_floor = float(decision_cfg.get("rules_containment_min_confidence", 0.40))
         short_margin = float(decision_cfg.get("rules_containment_min_margin", 0.08))
         short_lexical = float(decision_cfg.get("rules_containment_min_lexical", 0.50))
@@ -560,7 +559,7 @@ def _decide_connectors(
             for position, proposal in enumerate(ranked):
                 vectors.append(target_features(
                     proposal, second if position == 0 else first,
-                    1, len(graph.path_to_root(proposal.owner_party_id)),
+                    1, 1,
                 ))
                 destinations.append((len(contexts) - 1, len(context["mentions"]) - 1, proposal))
 
@@ -680,7 +679,6 @@ def _decide_connectors(
             decision.selected_mention_position = chosen["position"]
             decision.connector_resolution = resolution
             decision.decision = "MATCH"
-            decision.graph_path = graph.path_to_root(proposal.owner_party_id)
         decision.mention_results = mention_results
         decisions.append(decision)
     return decisions
@@ -688,17 +686,17 @@ def _decide_connectors(
 
 def decide_records(
     records: list[PartyRecord], proposals_by_record: dict[str, list[MatchProposal]],
-    graph: VerifiedGraph, scorer: FeatureScorer, reranker: CrossEncoderReranker,
+    catalog: VerifiedCatalog, scorer: FeatureScorer, reranker: CrossEncoderReranker,
     config: dict[str, Any],
 ) -> list[FinalDecision]:
     if str(config.get("matching", {}).get("connector_policy", "positional")) == "legacy":
-        return _decide_records_legacy(records, proposals_by_record, graph, scorer, reranker, config)
+        return _decide_records_legacy(records, proposals_by_record, catalog, scorer, reranker, config)
     plain, connector = [], []
     for record in records:
         mentions = parse_mentions(record)
         (connector if len(mentions) > 1 or mentions[0].parse_warning == "MALFORMED_CONNECTOR" else plain).append(record)
-    legacy = _decide_records_legacy(plain, proposals_by_record, graph, scorer, reranker, config)
-    resolved = _decide_connectors(connector, proposals_by_record, graph, scorer, reranker, config)
+    legacy = _decide_records_legacy(plain, proposals_by_record, catalog, scorer, reranker, config)
+    resolved = _decide_connectors(connector, proposals_by_record, catalog, scorer, reranker, config)
     by_id = {decision.adm_party_id: decision for decision in [*legacy, *resolved]}
     return [by_id[record.adm_party_id] for record in records]
 
@@ -754,7 +752,7 @@ def target_features(
     proposal: MatchProposal,
     runner_up_identity: float,
     supporting_mentions: int,
-    graph_depth: int,
+    catalog_depth: int,
 ) -> list[float]:
     identity = _combined_identity(proposal)
     return [
@@ -766,7 +764,7 @@ def target_features(
         float(proposal.exact),
         1.0 / max(1, proposal.candidate_collision_count),
         float(supporting_mentions),
-        float(graph_depth),
+        float(catalog_depth),
     ]
 
 

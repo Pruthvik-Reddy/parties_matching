@@ -38,9 +38,6 @@ class PartyRecord:
     raw_name: str
     source_row: int
     eligible: bool = True
-    parent_id: str | None = None
-    parent_is_verified: bool = False
-    is_verified: bool = False
 
 
 @dataclass
@@ -88,14 +85,6 @@ def parse_mentions(record: PartyRecord) -> list[OrganizationMention]:
             parse_warning=warning,
         ))
     return mentions
-
-
-@dataclass
-class ExpansionCandidate:
-    name: str
-    candidate_type: str = "alias"
-    llm_confidence: float | None = None
-    source: str = "llm"
 
 
 @dataclass
@@ -170,7 +159,6 @@ class FinalDecision:
     runner_up_party_id: str | None = None
     runner_up_score: float | None = None
     margin: float | None = None
-    graph_path: list[str] = field(default_factory=list)
     retrieved_root_ids: list[str] = field(default_factory=list)
     parse_warning: str | None = None
     connector_resolution: str | None = None

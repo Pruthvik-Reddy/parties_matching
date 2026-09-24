@@ -17,16 +17,18 @@ class HandoffTests(unittest.TestCase):
             {"verified_id": "carahsoft", "verified_name": "Carahsoft Technology Corp."},
             {"verified_id": "afrl", "verified_name": "Air Force Research Laboratory"},
             {"verified_id": "root", "verified_name": "Acme Holdings Inc."},
-            {"verified_id": "child", "verified_name": "Acme Services LLC", "parent_id": "root"},
+            {"verified_id": "child", "verified_name": "Acme Services LLC", "aliases": ["Acme Services"]},
         ]
 
-    def test_short_name_and_parent_root(self):
+    def test_short_name_and_flat_verified_id(self):
         result = match_parties(self.verified, [
             {"unverified_id": "u1", "unverified_name": "Carahsoft"},
             {"unverified_id": "u2", "unverified_name": "Acme Services LLC"},
+            {"unverified_id": "u3", "unverified_name": "Acme Services"},
         ])
         self.assertEqual((result[0]["decision"], result[0]["verified_id"]), ("MATCH", "carahsoft"))
-        self.assertEqual((result[1]["decision"], result[1]["verified_id"]), ("MATCH", "root"))
+        self.assertEqual((result[1]["decision"], result[1]["verified_id"]), ("MATCH", "child"))
+        self.assertEqual((result[2]["decision"], result[2]["verified_id"]), ("MATCH", "child"))
 
     def test_obo_and_via_prefer_left_exact_part(self):
         result = match_parties(self.verified, [
@@ -53,8 +55,8 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(result[0]["decision_tier"], "RULES_SAFE_VIEW_FIRST_SEGMENT")
         self.assertEqual(result[1]["decision_tier"], "RULES_SAFE_VIEW_PLURAL_IES")
 
-    def test_rejects_invalid_parent(self):
-        with self.assertRaisesRegex(ValueError, "Unknown parent_id"):
+    def test_rejects_parent_relationship_in_flat_catalog(self):
+        with self.assertRaisesRegex(ValueError, "parent_id is not supported"):
             match_parties([{"verified_id": "v1", "verified_name": "A", "parent_id": "missing"}], [])
 
     def test_csv_cli(self):
@@ -70,7 +72,7 @@ class HandoffTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 4)
             self.assertEqual(rows[0]["verified_id"], "carahsoft")
-            self.assertEqual(rows[2]["verified_id"], "acme_root")
+            self.assertEqual(rows[2]["verified_id"], "acme_child")
             self.assertEqual(rows[3]["decision"], "NO_MATCH")
 
 

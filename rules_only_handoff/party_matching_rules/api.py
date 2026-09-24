@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .domain import PartyRecord
-from .graph import VerifiedGraph
+from .catalog import VerifiedCatalog
 from .matching import (CrossEncoderReranker, FeatureScorer, MentionRetriever,
                        _token_idf, collect_proposals, decide_records)
 from .rules_enhancement import enhance_rules_decisions
@@ -29,12 +29,12 @@ def match_parties(
 ) -> list[dict[str, Any]]:
     """Match supplied names; return one decision per unverified input row.
 
-    Verified rows: verified_id, verified_name, optional parent_id and aliases.
+    Verified rows: verified_id, verified_name, optional aliases. No hierarchy.
     Unverified rows: unverified_id, unverified_name. No ground truth is used.
     """
     if not 0 <= settings.plain_cutoff <= 1 or not 0 <= settings.connector_cutoff <= 1:
         raise ValueError("Rule cutoffs must be between 0 and 1")
-    graph = VerifiedGraph(verified)
+    catalog = VerifiedCatalog(verified)
     input_rows = list(unverified)
     seen: set[str] = set()
     records = []
@@ -49,7 +49,7 @@ def match_parties(
         ))
     if not records:
         return []
-    if not graph.nodes:
+    if not catalog.parties:
         return [
             {"unverified_id": record.adm_party_id, "unverified_name": record.raw_name,
              "decision": "NO_MATCH", "verified_id": "", "verified_name": "",
@@ -86,15 +86,15 @@ def match_parties(
         },
     }
     retriever = MentionRetriever(records, retrieval, workers=1)
-    idf = _token_idf([node.party_name for node in graph.nodes.values()])
+    idf = _token_idf([party.party_name for party in catalog.parties.values()])
     scorer = FeatureScorer(idf, settings.connector_cutoff, settings.plain_cutoff)
-    proposals, _ = collect_proposals(graph, retriever, scorer)
-    baseline = decide_records(records, proposals, graph, scorer, CrossEncoderReranker(), config)
+    proposals, _ = collect_proposals(catalog, retriever, scorer)
+    baseline = decide_records(records, proposals, catalog, scorer, CrossEncoderReranker(), config)
     # Same order as the POC: first the ordinary rules decision, then guarded
     # short-name/name-view/core-anchor recovery for rejected plain names only.
-    no_request_cutoff = {party_id: {"confidenceCutoff": 0.0} for party_id in graph.nodes}
+    no_request_cutoff = {party_id: {"confidenceCutoff": 0.0} for party_id in catalog.parties}
     enhanced, _ = enhance_rules_decisions(
-        records, proposals, baseline, graph, retriever, scorer, config,
+        records, proposals, baseline, catalog, retriever, scorer, config,
         no_request_cutoff, {"confidenceCutoff": 0.0},
     )
     return [
