@@ -22,6 +22,11 @@ SEPARATOR = re.compile(r"-{2,}|\s+[-–—|/]\s*|\s*[-–—|/]\s+")
 TRAILING_PARENS = re.compile(r"^(.+?)\s*\(([^()]+)\)\s*\.?$")
 BRAND_CASE = re.compile(r"[a-z][A-Z]")
 FUNCTION_WORDS = {"a", "an", "and", "at", "by", "for", "in", "of", "on", "the", "to"}
+# Only equivalent spellings share a form. Distinct legal forms (Inc. versus
+# LLC) remain distinct verified identities, even when their base names match.
+LEGAL_FORM_GROUPS = {
+    "incorporated": "inc", "limited": "ltd", "corporation": "corp", "company": "co",
+}
 
 
 def name_views(raw_name: str) -> list[tuple[str, str, str]]:
@@ -330,6 +335,90 @@ def _root_base_index(graph: Any) -> dict[str, set[str]]:
     return roots
 
 
+def _explicit_legal_form(name: str) -> tuple[str, str] | None:
+    """Recognize one written legal form; compound/unstated forms stay ambiguous."""
+    tokens = normalize_name(name).split()
+    if len(tokens) < 2 or tokens[-1] not in LEGAL_SUFFIXES:
+        return None
+    if tokens[-2] in LEGAL_SUFFIXES:
+        return None
+    base = base_name(name)
+    if len(base.replace(" ", "")) < 4:
+        return None
+    form = LEGAL_FORM_GROUPS.get(tokens[-1], tokens[-1])
+    return base, form
+
+
+def _explicit_legal_form_candidate(
+    raw: str, old: FinalDecision, proposals: list[MatchProposal],
+    root_bases: dict[str, set[str]], form_roots: dict[tuple[str, str], set[str]],
+    plain_threshold: float,
+) -> MatchProposal | None:
+    """Break a same-base tie only when the input names one unique legal form."""
+    parsed = _explicit_legal_form(raw)
+    if old.reason != "AMBIGUOUS_FINAL_TARGETS" or parsed is None:
+        return None
+    base, form = parsed
+    competing = root_bases.get(base, set())
+    if (len(competing) < 2 or old.verified_party_id not in competing
+            or old.runner_up_party_id not in competing):
+        return None
+    matching_roots = form_roots.get((base, form), set())
+    if len(matching_roots) != 1:
+        return None
+    winner_root = next(iter(matching_roots))
+    if winner_root not in {old.verified_party_id, old.runner_up_party_id}:
+        return None
+    eligible = [
+        item for item in proposals
+        if item.root_party_id == winner_root and item.candidate_type == "official"
+        and item.candidate_collision_count == 1 and not item.digit_conflict
+        and normalize_name(item.matched_name) == normalize_name(raw)
+        and item.rules_score >= plain_threshold
+    ]
+    if not eligible:
+        return None
+    winner = max(eligible, key=lambda item: (item.rules_score, item.matched_name))
+    # A different organization with comparable evidence remains a real
+    # ambiguity; a legal-form tie-break must not erase that competition.
+    if any(
+        item.root_party_id != winner_root and base_name(item.matched_name) != base
+        and item.rules_score >= winner.rules_score - 0.04
+        for item in proposals
+    ):
+        return None
+    return winner
+
+
+def _and_equivalent_name(name: str) -> str:
+    """A local comparison view, not a global normalization/index change."""
+    return normalize_name(name.replace("&", " and "))
+
+
+def _laboratory_base(name: str) -> str:
+    """Only a lexical abbreviation: Labs/Lab and Laboratories/Laboratory.
+
+    This does not equate a laboratory with a separate business unit such as
+    Molecular or Nutrition, or establish a parent/subsidiary relationship.
+    """
+    forms = {"labs": "laboratories", "lab": "laboratory"}
+    return " ".join(forms.get(token, token) for token in base_name(name).split())
+
+
+def _leading_article_base(name: str) -> str:
+    """Compare an optional leading 'The' locally, never in the global index."""
+    tokens = base_name(name).split()
+    return " ".join(tokens[1:] if tokens and tokens[0] == "the" else tokens)
+
+
+def _and_name_index(graph: Any) -> dict[str, set[str]]:
+    roots: dict[str, set[str]] = defaultdict(set)
+    for party_id, node in graph.nodes.items():
+        if "&" in node.party_name or " and " in f" {normalize_name(node.party_name)} ":
+            roots[_and_equivalent_name(node.party_name)].add(graph.root_id(party_id))
+    return roots
+
+
 def _minor_spelling_variant(raw: str, official: str, idf: dict[str, float]) -> bool:
     """One small token edit in an otherwise complete name; never a missing word."""
     raw_tokens, official_tokens = base_name(raw).split(), base_name(official).split()
@@ -438,6 +527,7 @@ def _recover_second_pass(
     enhanced: dict[str, FinalDecision], graph: Any, scorer: Any,
     party_job: dict[str, dict], default_job: dict,
     root_tokens: dict[str, set[str]], root_prefixes: dict[str, set[str]],
+    enable_identity_tiebreak: bool = False,
 ) -> tuple[dict[str, FinalDecision], dict[str, int]]:
     """Revisit remaining plain NO_MATCH rows across retrieved roots only.
 
@@ -448,6 +538,17 @@ def _recover_second_pass(
     previous: dict[str, FinalDecision] = {}
     counts: dict[str, int] = defaultdict(int)
     root_bases = _root_base_index(graph)
+    form_roots: dict[tuple[str, str], set[str]] = defaultdict(set)
+    and_names = _and_name_index(graph) if enable_identity_tiebreak else {}
+    laboratory_roots: dict[str, set[str]] = defaultdict(set)
+    article_roots: dict[str, set[str]] = defaultdict(set)
+    if enable_identity_tiebreak:
+        for party_id, node in graph.nodes.items():
+            parsed = _explicit_legal_form(node.party_name)
+            if parsed is not None:
+                form_roots[parsed].add(graph.root_id(party_id))
+            laboratory_roots[_laboratory_base(node.party_name)].add(graph.root_id(party_id))
+            article_roots[_leading_article_base(node.party_name)].add(graph.root_id(party_id))
     for record in records:
         old = enhanced[record.adm_party_id]
         if old.decision != "NO_MATCH":
@@ -470,6 +571,74 @@ def _recover_second_pass(
             current = evidence.get(item.root_party_id)
             if current is None or (strength, item.rules_score) > (current[0], current[1].rules_score):
                 evidence[item.root_party_id] = (strength, item, kind)
+        if enable_identity_tiebreak:
+            article_base = _leading_article_base(record.raw_name)
+            if len(article_base.split()) >= 2 and article_roots.get(article_base):
+                for item in proposals:
+                    raw_has_the = normalize_name(record.raw_name).startswith("the ")
+                    official_has_the = normalize_name(item.matched_name).startswith("the ")
+                    if (raw_has_the == official_has_the or item.candidate_type != "official"
+                            or item.candidate_collision_count != 1 or item.digit_conflict
+                            or item.rules_score < 0.55
+                            or max(item.char_tfidf_score, item.word_tfidf_score) < 0.55
+                            or _leading_article_base(item.matched_name) != article_base
+                            or article_roots[article_base] != {item.root_party_id}):
+                        continue
+                    evidence[item.root_party_id] = (4, item, "LEADING_ARTICLE_EQUIVALENCE")
+            raw_laboratory_base = _laboratory_base(record.raw_name)
+            if (len(raw_laboratory_base.split()) >= 2
+                    and laboratory_roots.get(raw_laboratory_base)):
+                for item in proposals:
+                    raw_terms = set(normalize_name(record.raw_name).split())
+                    official_terms = set(normalize_name(item.matched_name).split())
+                    abbreviated = bool(
+                        (raw_terms & {"lab", "labs"} and official_terms & {"laboratory", "laboratories"})
+                        or (official_terms & {"lab", "labs"} and raw_terms & {"laboratory", "laboratories"})
+                    )
+                    if (item.candidate_type != "official" or item.candidate_collision_count != 1
+                            or item.digit_conflict or item.rules_score < 0.35
+                            or max(item.char_tfidf_score, item.word_tfidf_score) < 0.55
+                            or normalize_name(record.raw_name) == normalize_name(item.matched_name)
+                            or not abbreviated
+                            or _laboratory_base(item.matched_name) != raw_laboratory_base
+                            or laboratory_roots[raw_laboratory_base] != {item.root_party_id}):
+                        continue
+                    evidence[item.root_party_id] = (4, item, "LABORATORY_ABBREVIATION")
+            legal_winner = _explicit_legal_form_candidate(
+                record.raw_name, old, proposals, root_bases, form_roots,
+                float(scorer.plain_threshold if scorer.plain_threshold is not None else 0.80),
+            )
+            parsed_form = _explicit_legal_form(record.raw_name)
+            if (old.reason == "AMBIGUOUS_FINAL_TARGETS" and parsed_form is not None
+                    and len(root_bases.get(parsed_form[0], set())) > 1
+                    and legal_winner is None):
+                # Existing short-prefix recovery must not silently choose one
+                # of several registrations with the same stated legal form.
+                counts["unresolved_legal_form"] += 1
+                continue
+            if legal_winner is not None:
+                evidence[legal_winner.root_party_id] = (5, legal_winner, "EXPLICIT_LEGAL_FORM")
+            and_normalized = _and_equivalent_name(record.raw_name)
+            if (old.reason in {"AMBIGUOUS_FINAL_TARGETS", "CANDIDATE_COLLISION"}
+                    and len(and_names.get(and_normalized, set())) > 1):
+                counts["unresolved_and_equivalence"] += 1
+                continue
+            meaningful = [
+                token for token in and_normalized.split()
+                if token not in LEGAL_SUFFIXES | FUNCTION_WORDS and len(token) >= 3
+            ]
+            if len(meaningful) >= 2:
+                for item in proposals:
+                    if (item.candidate_type != "official" or item.candidate_collision_count != 1
+                            or item.digit_conflict or item.rules_score < 0.55
+                            or normalize_name(record.raw_name) == normalize_name(item.matched_name)
+                            or "&" not in (record.raw_name + item.matched_name)
+                            or _and_equivalent_name(item.matched_name) != and_normalized
+                            or and_names.get(and_normalized) != {item.root_party_id}):
+                        continue
+                    current = evidence.get(item.root_party_id)
+                    if current is None or (4, item.rules_score) > (current[0], current[1].rules_score):
+                        evidence[item.root_party_id] = (4, item, "AND_EQUIVALENCE")
         if not evidence:
             continue
         ranked = sorted(evidence.values(), key=lambda entry: (-entry[0], -entry[1].rules_score, entry[1].root_party_id))
@@ -712,6 +881,9 @@ def enhance_rules_decisions(
         second_previous, second_stats = _recover_second_pass(
             records, proposals_by_record, enhanced, graph, scorer, party_job, default_job,
             root_tokens, root_prefixes,
+            enable_identity_tiebreak=bool(config.get("decision", {}).get(
+                "rules_identity_tiebreak_enabled", False,
+            )),
         )
     regional_previous: dict[str, FinalDecision] = {}
     regional_stats: dict[str, int] = {}

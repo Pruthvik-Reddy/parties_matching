@@ -284,6 +284,10 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
         }
     held_out = [row for row in detail_rows if row["prediction"]["Held-Out"]]
     all_labeled = [row for row in detail_rows if row["prediction"]["Scorable"]]
+    all_labeled_excluding_error = [
+        row for row in all_labeled
+        if str(row["prediction"].get("Category") or "").strip().casefold() != "error"
+    ]
     split_names = sorted({row["prediction"]["Dataset Split"] for row in detail_rows})
     by_case: dict[str, Any] = {}
     case_names = sorted({
@@ -455,6 +459,7 @@ def _metrics(detail_rows: list[dict[str, Any]], run_stats: dict[str, Any]) -> di
             },
         },
         "all_labeled": summarize(all_labeled),
+        "all_labeled_excluding_error": summarize(all_labeled_excluding_error),
         "cohorts": cohorts,
         "by_split": {
             split: summarize([row for row in detail_rows if row["prediction"]["Dataset Split"] == split])
@@ -572,7 +577,7 @@ def _write_workbook(
     summary.set_tab_color("#1F4E78")
     summary.write("A2", "Rules-only party matching evaluation" if is_rules else "Party matching evaluation", title)
     _section_band(summary, 3, 0, 1, "Run summary", section)
-    _section_band(summary, 3, 3, 8, "Held-out rules-only" if is_rules else "Held-out ML versus rules-only", section)
+    _section_band(summary, 3, 3, 8, "Rules-only evaluation" if is_rules else "Held-out ML versus rules-only", section)
     if not is_rules:
         _section_band(summary, 3, 11, 12, "Matching stage profile", section)
     summary.write_row("A5", ["Metric", "Value"], header)
@@ -581,7 +586,10 @@ def _write_workbook(
         summary.write_row(4, 11, ["Stage", "Seconds / MB"], header)
     overall = metrics["overall"]
     method_rows = (
-        ((5, "Enhanced rules", overall),) if is_rules else (
+        (
+            (5, "Held-out enhanced rules", overall),
+            (6, "All labeled excl. ERROR", metrics["all_labeled_excluding_error"]),
+        ) if is_rules else (
             (5, "ML", overall),
             (6, "Rules only - enhanced", metrics["rules_only"]),
             (7, "Rules only - before core anchor", metrics["rules_only"]["before_core_anchor"]),
@@ -658,6 +666,9 @@ def _write_workbook(
             ("Precision 95% CI high", overall["precision_ci_95_high"], percent),
             ("Held-out recall", overall["recall"], percent),
             ("Held-out F1", overall["f1"], percent),
+            ("All labeled rows (excl. ERROR)", metrics["all_labeled_excluding_error"]["scorable"], integer),
+            ("All labeled correct (excl. ERROR)", metrics["all_labeled_excluding_error"]["correct_matches"], integer),
+            ("All labeled recall (excl. ERROR)", metrics["all_labeled_excluding_error"]["recall"], percent),
             ("Held-out coverage", overall["coverage"], percent),
             ("Held-out retrieval recall", overall["retrieval_recall"], percent),
             ("Unknown rows (not scored)", metrics["unknown_predictions"]["rows"], integer),
@@ -666,12 +677,15 @@ def _write_workbook(
             ("Rules-only plain cutoff", run_stats.get("rules_plain_threshold"), decimal),
             ("Rules enhancement enabled", "yes" if run_stats.get("rules_enhanced_enabled") else "no", text),
             ("Rules multiword prefix enabled", "yes" if run_stats.get("rules_multiword_prefix_enabled") else "no", text),
+            ("Rules identity tie-break enabled", "yes" if run_stats.get("rules_identity_tiebreak_enabled") else "no", text),
             ("Rules short-name matches", (run_stats.get("rules_enhancement") or {}).get("short_name_matches"), integer),
             ("Rules multiword prefix matches", (run_stats.get("rules_enhancement") or {}).get("multiword_short_name_matches"), integer),
             ("Rules connector multiword prefix matches", run_stats.get("rules_connector_multiword_matches"), integer),
             ("Rules connector ambiguous-prefix abstentions", run_stats.get("rules_connector_ambiguous_prefix_abstentions"), integer),
             ("Rules safe-view matches", (run_stats.get("rules_enhancement") or {}).get("safe_view_matches"), integer),
             ("Rules core-anchor matches", (run_stats.get("rules_enhancement") or {}).get("core_anchor_matches"), integer),
+            ("Explicit legal-form recoveries", ((run_stats.get("rules_enhancement") or {}).get("second_pass") or {}).get("explicit_legal_form"), integer),
+            ("And/ampersand recoveries", ((run_stats.get("rules_enhancement") or {}).get("second_pass") or {}).get("and_equivalence"), integer),
         ]
     profile_keys = (
         "graph_seconds", "index_seconds", "retrieval_seconds", "retrieval_query_seconds", "char_matrix_seconds",

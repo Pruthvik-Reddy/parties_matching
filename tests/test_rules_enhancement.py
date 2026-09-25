@@ -9,7 +9,7 @@ from party_matching.matching import FeatureScorer
 from party_matching.reporting import _write_rules_changes
 from party_matching.rules_enhancement import (
     _anchored_official_prefix, _minor_spelling_variant, _recover_regional, _recover_second_pass,
-    _regional_qualifier_evidence, _root_prefix_index, _root_token_index,
+    _regional_qualifier_evidence, _root_prefix_index, _root_token_index, _laboratory_base,
     _unique_short_name, _unsafe_removed,
     enhance_rules_decisions, name_views, soft_token_coverage,
 )
@@ -121,6 +121,8 @@ class EnhancedRulesTests(unittest.TestCase):
         self.assertEqual(stats["unsafe_core_anchors_skipped"], 1)
 
     def test_only_rejected_plain_rows_are_enhanced(self):
+        self.config["decision"].update({"rules_second_pass_enabled": True,
+                                         "rules_identity_tiebreak_enabled": True})
         carahsoft = PartyRecord("account", "raw-c", "Carahsoft Technology - Partner", 1)
         cooper = PartyRecord("account", "raw-o", "Cooper Holdings, Inc. - SpringCM", 2)
         connector = PartyRecord("account", "raw-obo", "Carahsoft OBO Partner", 3)
@@ -201,6 +203,101 @@ class EnhancedRulesTests(unittest.TestCase):
         _recover_second_pass(*kwargs)
         self.assertEqual(enhanced[record.adm_party_id].decision, "NO_MATCH")
 
+    def test_explicit_legal_form_breaks_only_a_distinct_form_tie(self):
+        self.graph.add_parties([
+            {"partyId": "tock-inc", "partyName": "Tock, Inc."},
+            {"partyId": "tock-llc", "partyName": "Tock, LLC"},
+        ])
+        raw = "Tock Inc"
+        record = PartyRecord("account", "tock-raw", raw, 1)
+        inc = self.proposal(record.adm_party_id, raw, "tock-inc", "Tock, Inc.")
+        llc = self.proposal(record.adm_party_id, raw, "tock-llc", "Tock, LLC")
+        inc.rules_score, llc.rules_score = 0.95, 0.93
+        old = self.rejected(record.adm_party_id, raw, "tock-llc", "Tock, LLC")
+        old.reason, old.runner_up_party_id, old.margin = "AMBIGUOUS_FINAL_TARGETS", "tock-inc", 0.02
+        proposals = {record.adm_party_id: [inc, llc]}
+        retriever = SimpleNamespace(char_vectorizer=None, word_vectorizer=None)
+        self.config["decision"].update({"rules_second_pass_enabled": True,
+                                         "rules_identity_tiebreak_enabled": False})
+        disabled, _ = enhance_rules_decisions(
+            [record], proposals, [old], self.graph, retriever, self.scorer,
+            self.config, {}, {"confidenceCutoff": 0.0},
+        )
+        self.assertEqual(disabled[0].decision, "NO_MATCH")
+        self.config["decision"]["rules_identity_tiebreak_enabled"] = True
+        enabled, stats = enhance_rules_decisions(
+            [record], proposals, [old], self.graph, retriever, self.scorer,
+            self.config, {}, {"confidenceCutoff": 0.0},
+        )
+        self.assertEqual(enabled[0].verified_party_id, "tock-inc")
+        self.assertEqual(enabled[0].decision_tier, "RULES_SECOND_PASS_EXPLICIT_LEGAL_FORM")
+        self.assertEqual(enabled[0].confidence, inc.rules_score)
+        self.assertEqual(stats["second_pass"]["explicit_legal_form"], 1)
+        self.assertEqual(old.decision, "NO_MATCH")
+
+    def test_legal_form_tie_abstains_when_form_is_unstated_or_equivalent(self):
+        self.graph.add_parties([
+            {"partyId": "sodexo", "partyName": "Sodexo"},
+            {"partyId": "sodexo-inc", "partyName": "Sodexo, Inc."},
+            {"partyId": "qbs-ltd", "partyName": "QBS Software Ltd"},
+            {"partyId": "qbs-limited", "partyName": "QBS Software Limited"},
+        ])
+        for adm_id, raw, roots, names in (
+            ("sodexo-raw", "Sodexo", ("sodexo", "sodexo-inc"), ("Sodexo", "Sodexo, Inc.")),
+            ("qbs-raw", "QBS Software Ltd", ("qbs-ltd", "qbs-limited"),
+             ("QBS Software Ltd", "QBS Software Limited")),
+        ):
+            with self.subTest(raw=raw):
+                record = PartyRecord("account", adm_id, raw, 1)
+                proposals = [self.proposal(adm_id, raw, root, name)
+                             for root, name in zip(roots, names)]
+                old = self.rejected(adm_id, raw, roots[0], names[0])
+                old.reason, old.runner_up_party_id, old.margin = "AMBIGUOUS_FINAL_TARGETS", roots[1], 0.02
+                enhanced = {adm_id: old}
+                previous, _ = _recover_second_pass(
+                    [record], {adm_id: proposals}, enhanced, self.graph, self.scorer,
+                    {}, {"confidenceCutoff": 0.0}, _root_token_index(self.graph),
+                    _root_prefix_index(self.graph, {raw}), enable_identity_tiebreak=True,
+                )
+                self.assertFalse(previous)
+                self.assertIs(enhanced[adm_id], old)
+
+    def test_and_equivalence_requires_one_official_root(self):
+        self.graph.add_parties([
+            {"partyId": "loveday", "partyName": "Loveday & Partners Ltd"},
+        ])
+        raw = "Loveday and Partners Ltd"
+        record = PartyRecord("account", "loveday-raw", raw, 1)
+        proposal = self.proposal(record.adm_party_id, raw, "loveday", "Loveday & Partners Ltd")
+        proposal.rules_score = 0.7996
+        old = self.rejected(record.adm_party_id, raw, "loveday", "Loveday & Partners Ltd")
+        enhanced = {record.adm_party_id: old}
+        args = ([record], {record.adm_party_id: [proposal]}, enhanced, self.graph,
+                self.scorer, {}, {"confidenceCutoff": 0.0}, _root_token_index(self.graph),
+                _root_prefix_index(self.graph, {raw}))
+        _recover_second_pass(*args)
+        self.assertIs(enhanced[record.adm_party_id], old)
+        previous, stats = _recover_second_pass(*args, enable_identity_tiebreak=True)
+        self.assertIs(previous[record.adm_party_id], old)
+        self.assertEqual(enhanced[record.adm_party_id].verified_party_id, "loveday")
+        self.assertEqual(enhanced[record.adm_party_id].decision_tier,
+                         "RULES_SECOND_PASS_AND_EQUIVALENCE")
+        self.assertEqual(stats["and_equivalence"], 1)
+        self.graph.add_parties([
+            {"partyId": "loveday-other", "partyName": "Loveday and Partners Ltd"},
+        ])
+        other = self.proposal(record.adm_party_id, raw, "loveday-other", "Loveday and Partners Ltd")
+        old.reason, old.runner_up_party_id = "AMBIGUOUS_FINAL_TARGETS", "loveday-other"
+        enhanced[record.adm_party_id] = old
+        previous, _ = _recover_second_pass(
+            [record], {record.adm_party_id: [proposal, other]}, enhanced,
+            self.graph, self.scorer, {}, {"confidenceCutoff": 0.0},
+            _root_token_index(self.graph), _root_prefix_index(self.graph, {raw}),
+            enable_identity_tiebreak=True,
+        )
+        self.assertFalse(previous)
+        self.assertIs(enhanced[record.adm_party_id], old)
+
     def test_second_pass_allows_only_a_small_complete_name_typo(self):
         raw = "Carasoft Technology"
         record = PartyRecord("account", "typo", raw, 1)
@@ -219,6 +316,51 @@ class EnhancedRulesTests(unittest.TestCase):
         self.assertFalse(
             _minor_spelling_variant("Carasoft Technology Partner", "Carahsoft Technology Corp.", {})
         )
+
+    def test_labs_laboratories_is_a_unique_name_variant_not_a_family_merge(self):
+        self.graph.add_parties([{"partyId": "abbott", "partyName": "Abbott Laboratories"}])
+        raw = "Abbott Labs"
+        record = PartyRecord("account", "abbott-raw", raw, 1)
+        proposal = self.proposal("abbott-raw", raw, "abbott", "Abbott Laboratories")
+        proposal.rules_score = 0.65
+        old = self.rejected("abbott-raw", raw, "abbott", "Abbott Laboratories")
+        enhanced = {"abbott-raw": old}
+        args = ([record], {"abbott-raw": [proposal]}, enhanced, self.graph,
+                self.scorer, {}, {"confidenceCutoff": 0.0}, _root_token_index(self.graph),
+                _root_prefix_index(self.graph, {raw}))
+        _recover_second_pass(*args, enable_identity_tiebreak=True)
+        self.assertEqual(enhanced["abbott-raw"].decision_tier,
+                         "RULES_SECOND_PASS_LABORATORY_ABBREVIATION")
+
+        # Molecular/Nutrition are different names, not mere abbreviations.
+        self.assertNotEqual(
+            _laboratory_base("Abbott Molecular"), _laboratory_base("Abbott Laboratories")
+        )
+        self.graph.add_parties([{"partyId": "abbott-labs", "partyName": "Abbott Labs"}])
+        enhanced["abbott-raw"] = old
+        previous, _ = _recover_second_pass(*args, enable_identity_tiebreak=True)
+        self.assertFalse(previous)
+        self.assertIs(enhanced["abbott-raw"], old)
+
+    def test_leading_the_is_local_equivalence_only_when_root_is_unique(self):
+        self.graph.add_parties([{"partyId": "foundation", "partyName": "The Mastercard Foundation"}])
+        raw = "Mastercard Foundation"
+        record = PartyRecord("account", "foundation-raw", raw, 1)
+        proposal = self.proposal("foundation-raw", raw, "foundation", "The Mastercard Foundation")
+        proposal.rules_score = 0.799
+        old = self.rejected("foundation-raw", raw, "foundation", "The Mastercard Foundation")
+        enhanced = {"foundation-raw": old}
+        args = ([record], {"foundation-raw": [proposal]}, enhanced, self.graph,
+                self.scorer, {}, {"confidenceCutoff": 0.0}, _root_token_index(self.graph),
+                _root_prefix_index(self.graph, {raw}))
+        _recover_second_pass(*args, enable_identity_tiebreak=True)
+        self.assertEqual(enhanced["foundation-raw"].decision_tier,
+                         "RULES_SECOND_PASS_LEADING_ARTICLE_EQUIVALENCE")
+        self.graph.add_parties([{"partyId": "foundation-other", "partyName": raw}])
+        enhanced["foundation-raw"] = old
+        previous, _ = _recover_second_pass(*args, enable_identity_tiebreak=True)
+        self.assertFalse(previous)
+        self.assertIs(enhanced["foundation-raw"], old)
 
     def test_regional_route_adds_only_unambiguous_geographic_variant(self):
         self.graph.add_parties([{"partyId": "acme", "partyName": "Acme Corp."}])

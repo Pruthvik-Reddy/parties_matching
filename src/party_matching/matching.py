@@ -1148,6 +1148,23 @@ def run_matching(
     regional_comparison = _compare_rules_second_pass(
         prepared / "labels.jsonl", graph, rules_pre_regional, rules_decisions,
     )
+    # Optional plain-name fragment selector. Keep the complete enhanced rules
+    # decision set in this run for an apples-to-apples rollback/comparison.
+    rules_pre_multipart = rules_decisions
+    multipart_stats = None
+    if bool(config.get("decision", {}).get("rules_multipart_enabled", False)):
+        from .rules_multipart import choose_multipart_rules
+        multipart_started = time.perf_counter()
+        rules_decisions, multipart_stats = choose_multipart_rules(
+            matchable, rules_decisions, graph, rules_scorer,
+            config.get("retrieval", {}), workers, prepared / "labels.jsonl",
+            party_job, default_job,
+            float(config.get("decision", {}).get("rules_multipart_min_confidence", 0.80)),
+        )
+        multipart_stats["seconds"] = time.perf_counter() - multipart_started
+    multipart_comparison = _compare_rules_second_pass(
+        prepared / "labels.jsonl", graph, rules_pre_multipart, rules_decisions,
+    )
     events: list[dict[str, Any]] = []
     for update in graph_updates:
         root_id = graph.root_id(update["child_id"])
@@ -1197,9 +1214,12 @@ def run_matching(
                 (decision.to_dict() for decision in rules_pre_second_pass))
     write_jsonl(output / "rules_pre_regional_decisions.jsonl",
                 (decision.to_dict() for decision in rules_pre_regional))
+    write_jsonl(output / "rules_pre_multipart_decisions.jsonl",
+                (decision.to_dict() for decision in rules_pre_multipart))
     write_jsonl(output / "rules_baseline_decisions.jsonl", (decision.to_dict() for decision in baseline_rules_decisions))
     write_json(output / "rules_second_pass_comparison.json", second_pass_comparison)
     write_json(output / "rules_regional_comparison.json", regional_comparison)
+    write_json(output / "rules_multipart_comparison.json", multipart_comparison)
     write_jsonl(output / "events.jsonl", events)
     if new_mappings and not fresh_state:
         existing = list(read_jsonl(mapping_path)) if mapping_path.exists() else []
@@ -1230,9 +1250,13 @@ def run_matching(
         "rules_connector_short_name_enabled": bool(config.get("decision", {}).get("rules_connector_short_name_enabled", False)),
         "rules_multiword_prefix_enabled": bool(config.get("decision", {}).get("rules_multiword_prefix_enabled", False)),
         "rules_second_pass_enabled": bool(config.get("decision", {}).get("rules_second_pass_enabled", False)),
+        "rules_identity_tiebreak_enabled": bool(config.get("decision", {}).get("rules_identity_tiebreak_enabled", False)),
         "rules_second_pass_comparison": second_pass_comparison,
         "rules_regional_enabled": bool(config.get("decision", {}).get("rules_regional_enabled", False)),
         "rules_regional_comparison": regional_comparison,
+        "rules_multipart_enabled": bool(config.get("decision", {}).get("rules_multipart_enabled", False)),
+        "rules_multipart_comparison": multipart_comparison,
+        **({"rules_multipart": multipart_stats} if multipart_stats is not None else {}),
         "rules_connector_short_name_matches": sum(
             decision.decision == "MATCH" and decision.decision_tier in {
                 "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME", "RULES_ROOT_UNIQUE_CONNECTOR_PREFIX",
