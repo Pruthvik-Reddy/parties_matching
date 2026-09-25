@@ -1,31 +1,54 @@
 # Verified-party-first suggestions
 
-## Two-snapshot demo: one representative, then an expanded verified list
+## Two-snapshot demo: actual verified-name groups, then expanded verified list
 
 Use this when you want to show how suggestions change as more verified names
 become available. It reuses the enhanced POC rules, including OBO/VIA, and
 does **not** change the main matcher, saved graph, events, or mappings.
 
 ```powershell
-.\.venv\Scripts\python.exe -m suggestions.snapshot_demo --config config.toml --representative "Microsoft Corporation" --add-verified "Microsoft Worldwide" --output-dir outputs\microsoft_snapshots_1 --xlsx
+.\.venv\Scripts\python.exe -m suggestions.snapshot_demo --config config.toml --max-families 3 --output-dir outputs\verified_snapshots_1 --xlsx
 ```
 
-The command keeps every non-Microsoft verified party in both snapshots. In
-the **initial simulated catalog**, it retains Microsoft Corporation and
-temporarily withholds the other current verified names whose first meaningful
-token is `microsoft`. In the **expanded catalog**, those parties return;
-`--add-verified` also supplies Microsoft Worldwide if it is not already in the
-catalog. `scenario.json` and the expanded workbook's `Scenario` sheet list
-every withheld name. Review that list: a shared first token is a demo
-selection rule, not proof of corporate ownership. This is a simulation unless
-your verified-party arrival dates independently confirm it.
-For a related verified party with a different leading token, add
-`--withhold-verified "Exact Current Verified Name"` (repeatable); it will be
-withheld only initially and listed in the `Scenario` sheet.
+For the nine examples supplied for the demo, use the checked-in list instead:
+
+```powershell
+.\.venv\Scripts\python.exe -m suggestions.snapshot_demo --config config.toml --representatives-file suggestions\demo_representatives.json --output-dir outputs\listed_snapshots_1 --xlsx
+```
+
+Every listed name must exactly and uniquely occur in the prepared verified
+catalog. The command reports **all** missing names together so you can correct
+the list or prepare the full work catalog; it does not silently replace a
+missing name with a similar one. If a listed group has no additional verified
+names, its initial and expanded states may be identical, which is reported
+rather than fabricated. Edit the JSON list to use a different set of real
+verified parties.
+
+Without `--representative` or `--representatives-file`, the command picks up
+to three actual verified-name
+groups in the prepared catalog. Each group must have at least two verified
+names sharing a non-generic first meaningful token and at least three eligible
+unverified names containing that token; the groups with the most such rows are
+selected. Use `--max-families` and `--min-family-unverified` to adjust these
+selection limits. For each selected group, the shortest meaningful verified
+name is kept as the **initial simulated representative**. Other verified names
+in that group are withheld initially and return in the expanded catalog. All
+verified names outside the selected groups remain in both snapshots and can
+compete for suggestions. The `Scenario` sheet and `scenario.json` list the
+groups, representatives, and withheld names. A shared first token is only a
+transparent demo-selection heuristic, not proof of ownership or an actual
+onboarding order. If no suitable group exists, the command stops and asks for
+a fuller prepared catalog or different limits; it never makes up company names.
+
+You can still focus on one known party with `--representative "Exact Current
+Verified Name"`. In this explicit mode only, `--withhold-verified "Exact
+Current Verified Name"` can add a party with a different leading token to the
+initially withheld set, and `--add-verified "New Name"` can simulate a truly
+new verified party. Both flags are repeatable.
 
 By default, both snapshots score the **same eligible unverified names** that
-contain `microsoft` in any parsed segment. This is the quick demo mode, not a
-full-dataset recall test; it includes matching OBO/VIA segments. Add
+contain any selected group token in a parsed segment. This is the quick demo
+mode, not a full-dataset recall test; it includes matching OBO/VIA segments. Add
 `--all-unverified` to score the entire eligible dataset in both snapshots,
 which takes longer. Use a fresh `--output-dir` for each run.
 

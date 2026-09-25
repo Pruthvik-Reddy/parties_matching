@@ -159,8 +159,8 @@ if (poc && scenario) {
   })), ["verified_party", "verified_party_id"]);
   scope.getRange("D5:E17").values = [
     ["Scenario detail", "Value"],
-    ["Initial representative", scenario.representative],
-    ["Family token", scenario.family_anchor],
+    ["Initial representative", scenario.families?.length > 1 ? `${scenario.families.length} selected (see right)` : scenario.representative],
+    ["Family token", scenario.families?.length > 1 ? "Multiple (see right)" : scenario.family_anchor],
     ["Unverified names scored", Number(scenario.selected_unverified_names)],
     ["Input selection", scenario.input_selection],
     ["Added only in expanded", scenario.added_only_in_expanded.join(" / ")],
@@ -183,6 +183,23 @@ if (poc && scenario) {
   scope.getRange("E14").setNumberFormat("0.0%");
   scope.getRange("E15:E16").setNumberFormat("#,##0");
   scope.getRange("E17").setNumberFormat("0.0%");
+  if (scenario.families?.length) {
+    scope.getRange("G5:J5").values = [[
+      "Selected representative", "Shared token", "Verified names", "Eligible raw names",
+    ]];
+    scope.getRange("G5:J5").format = {
+      fill: navy, font: {name: "Arial", size: 10, bold: true, color: "#FFFFFF"},
+      rowHeight: 29, verticalAlignment: "center",
+    };
+    scope.getRange("G:G").format.columnWidth = 48;
+    scope.getRange("H:H").format.columnWidth = 22;
+    scope.getRange("I:J").format.columnWidth = 20;
+    scope.getRange(`G6:J${5 + scenario.families.length}`).values = scenario.families.map(family => [
+      family.representative, family.anchor, family.verified_names.length,
+      family.eligible_unverified_with_token ?? "Not counted",
+    ]);
+    scope.getRange(`I6:J${5 + scenario.families.length}`).setNumberFormat("#,##0");
+  }
 }
 
 workbook.recalculate();

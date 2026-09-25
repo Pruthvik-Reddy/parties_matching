@@ -56,6 +56,47 @@ def test_snapshot_requires_existing_representative():
         try:
             build_snapshots(prepared, load_config("config.toml"), "Microsoft Corporation")
         except ValueError as error:
-            assert "exactly name one" in str(error)
+            assert "not unique exact names" in str(error)
         else:
             raise AssertionError("Expected a representative-selection error")
+
+
+def test_named_list_selects_multiple_real_groups_without_labels():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        prepared = root / "prepared"
+        prepared.mkdir()
+        catalog = [
+            {"partyId": "a1", "partyName": "Abbott Laboratories"},
+            {"partyId": "a2", "partyName": "Abbott Molecular"},
+            {"partyId": "c1", "partyName": "Coherent Corp."},
+            {"partyId": "c2", "partyName": "Coherent Technologies"},
+        ]
+        (prepared / "verified_parties.json").write_text(json.dumps(catalog), encoding="utf-8")
+        (prepared / "jobs.json").write_text(json.dumps([{
+            "accountId": "test", "confidenceCutoff": 0.0, "verifiedParties": catalog,
+        }]), encoding="utf-8")
+        names = ["Abbott Laboratories", "Abbott Molecular", "Coherent Corp.",
+                 "Coherent Technologies", "Unrelated Party"]
+        (prepared / "adm_records.jsonl").write_text(
+            "\n".join(json.dumps({"account_id": "test", "adm_party_id": str(i),
+                                   "raw_name": name, "source_row": i,
+                                   "eligible": True, "is_verified": False})
+                      for i, name in enumerate(names, 1)) + "\n", encoding="utf-8")
+        config = load_config("config.toml")
+        config["paths"]["state_dir"] = str(root / "state")
+        config["paths"]["artifacts_dir"] = str(root / "artifacts")
+        config["execution"]["mode"] = "serial"
+        config["retrieval"]["embedding_enabled"] = False
+        initial, expanded, _, manifest = build_snapshots(
+            prepared, config, representative_list=[
+                {"name": "Abbott Laboratories"}, {"name": "Coherent Corp."},
+            ])
+        assert manifest["selection_mode"] == "attached_list"
+        assert manifest["selected_unverified_names"] == 4
+        assert {row["partyName"] for row in manifest["withheld_initially"]} == {
+            "Abbott Molecular", "Coherent Technologies"}
+        assert [row["representative"] for row in manifest["families"]] == [
+            "Abbott Laboratories", "Coherent Corp."]
+        assert initial[2]["counts"]["unverified_scored"] == expanded[2]["counts"]["unverified_scored"] == 4
+        assert not (root / "state").exists()
