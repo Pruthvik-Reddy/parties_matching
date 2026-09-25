@@ -76,6 +76,7 @@ rules_identity_tiebreak_enabled = true # second-pass only: unique explicit legal
 rules_regional_enabled = true # optional final regional qualifier route for remaining plain NO_MATCH rows; false keeps every pre-regional rules decision
 rules_multipart_enabled = true # optional forced choice for strong competing plain-name fragments; false restores enhanced rules exactly
 rules_multipart_min_confidence = 0.80 # independent safety floor; lower this and rules_plain_threshold only if later evidence supports it
+rules_verified_anchor_enabled = true # final plain NO_MATCH recovery from a unique verified-name prefix/base; false restores pre-anchor rules
 rules_containment_enabled = true # set false to compare against the plain-cutoff baseline
 rules_containment_min_confidence = 0.40
 rules_containment_min_margin = 0.08

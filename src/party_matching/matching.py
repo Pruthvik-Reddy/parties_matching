@@ -1165,6 +1165,42 @@ def run_matching(
     multipart_comparison = _compare_rules_second_pass(
         prepared / "labels.jsonl", graph, rules_pre_multipart, rules_decisions,
     )
+    # Final, optional rules-only recovery. Keep the prior result in the same
+    # run so this general anchor experiment can be evaluated and reverted.
+    rules_pre_anchor = rules_decisions
+    anchor_stats = None
+    if bool(config.get("decision", {}).get("rules_verified_anchor_enabled", False)):
+        from .rules_anchor import recover_verified_name_anchors
+        anchor_started = time.perf_counter()
+        rules_decisions, anchor_stats = recover_verified_name_anchors(
+            matchable, rules_decisions, graph, proposals, retriever,
+            rules_scorer, party_job, default_job,
+        )
+        anchor_stats["seconds"] = time.perf_counter() - anchor_started
+    anchor_comparison = _compare_rules_second_pass(
+        prepared / "labels.jsonl", graph, rules_pre_anchor, rules_decisions,
+    )
+    anchor_changes = []
+    if anchor_stats is not None:
+        anchor_labels = {row["adm_party_id"]: row for row in read_jsonl(prepared / "labels.jsonl")}
+        for old, new in zip(rules_pre_anchor, rules_decisions):
+            if (old.decision, old.verified_party_id) == (new.decision, new.verified_party_id):
+                continue
+            label = anchor_labels.get(old.adm_party_id, {})
+            expected = label.get("expected_party_id")
+            if expected in graph.nodes:
+                expected = graph.root_id(expected)
+            anchor_changes.append({
+                "adm_party_id": old.adm_party_id, "raw_name": old.raw_name,
+                "split": label.get("split"), "category": label.get("category"),
+                "expected_party_id": expected, "expected_name": label.get("expected_canonical_name"),
+                "before_decision": old.decision, "before_party_id": old.verified_party_id,
+                "before_party_name": old.verified_party_name, "before_reason": old.reason,
+                "after_decision": new.decision, "after_party_id": new.verified_party_id,
+                "after_party_name": new.verified_party_name, "after_method": new.match_method,
+                "after_tier": new.decision_tier, "after_confidence": new.confidence,
+                "after_correct": (new.verified_party_id == expected if label.get("scorable") else None),
+            })
     events: list[dict[str, Any]] = []
     for update in graph_updates:
         root_id = graph.root_id(update["child_id"])
@@ -1216,10 +1252,14 @@ def run_matching(
                 (decision.to_dict() for decision in rules_pre_regional))
     write_jsonl(output / "rules_pre_multipart_decisions.jsonl",
                 (decision.to_dict() for decision in rules_pre_multipart))
+    write_jsonl(output / "rules_pre_anchor_decisions.jsonl",
+                (decision.to_dict() for decision in rules_pre_anchor))
+    write_jsonl(output / "rules_anchor_changes.jsonl", anchor_changes)
     write_jsonl(output / "rules_baseline_decisions.jsonl", (decision.to_dict() for decision in baseline_rules_decisions))
     write_json(output / "rules_second_pass_comparison.json", second_pass_comparison)
     write_json(output / "rules_regional_comparison.json", regional_comparison)
     write_json(output / "rules_multipart_comparison.json", multipart_comparison)
+    write_json(output / "rules_anchor_comparison.json", anchor_comparison)
     write_jsonl(output / "events.jsonl", events)
     if new_mappings and not fresh_state:
         existing = list(read_jsonl(mapping_path)) if mapping_path.exists() else []
@@ -1257,6 +1297,9 @@ def run_matching(
         "rules_multipart_enabled": bool(config.get("decision", {}).get("rules_multipart_enabled", False)),
         "rules_multipart_comparison": multipart_comparison,
         **({"rules_multipart": multipart_stats} if multipart_stats is not None else {}),
+        "rules_verified_anchor_enabled": bool(config.get("decision", {}).get("rules_verified_anchor_enabled", False)),
+        "rules_anchor_comparison": anchor_comparison,
+        **({"rules_anchor": anchor_stats} if anchor_stats is not None else {}),
         "rules_connector_short_name_matches": sum(
             decision.decision == "MATCH" and decision.decision_tier in {
                 "RULES_ROOT_UNIQUE_CONNECTOR_SHORT_NAME", "RULES_ROOT_UNIQUE_CONNECTOR_PREFIX",
