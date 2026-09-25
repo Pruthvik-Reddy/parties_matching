@@ -121,3 +121,67 @@ def export_snapshot(folder: Path, result: tuple[list[dict], list[dict], dict],
     finally:
         book.close()
     return path
+
+
+def export_family_snapshot(folder: Path, result: dict) -> Path:
+    """Display saved pair outcomes; labels remain in a separate audit tab.
+
+    The established Python-only exporter is retained for the work-laptop demo.
+    No workbook formula participates in retrieval, scoring, or classification.
+    """
+    path = folder / "suggestions_current.xlsx"
+    book = xlsxwriter.Workbook(str(path), {"constant_memory": True,
+                                           "strings_to_formulas": False,
+                                           "strings_to_urls": False})
+    try:
+        parties = result["parties"]
+        _table(book, "Verified parties",
+               ["Verified party", "Strong", "Review", "Dropped", "Known labels",
+                "Not retrieved", "Family-gate exclusions", "Held-out candidate recall", "Held-out strong precision",
+                "Verified ID"], parties,
+               ["verified_party", "strong", "review", "dropped", "known_labels",
+                "known_label_index_misses", "known_label_gate_exclusions", "held_out_candidate_recall",
+                "held_out_strong_precision", "verified_party_id"],
+               [48, 14, 14, 14, 16, 20, 24, 24, 24, 40],
+               percent_keys={"held_out_candidate_recall", "held_out_strong_precision"})
+        detail_headers = ["Verified party", "Unverified party", "Reason", "Rules score",
+                          "Lexical score", "Family similarity", "Retrieval source",
+                          "Matched segment", "Case", "Matched verified party", "Assigned elsewhere to", "Source row",
+                          "Verified ID", "Unverified ID"]
+        detail_keys = ["verified_party", "unverified_party", "reason", "rules_score",
+                       "lexical_score", "family_similarity", "retrieval_source",
+                       "matched_segment", "name_case", "matched_verified_party", "assigned_to", "source_row",
+                       "verified_party_id", "unverified_party_id"]
+        widths = [48, 62, 32, 15, 15, 17, 22, 48, 14, 48, 48, 14, 40, 40]
+        for title, key in (("Strong suggestions", "strong"),
+                           ("Review candidates", "review"),
+                           ("Dropped candidates", "dropped")):
+            _table(book, title, detail_headers, result[key], detail_keys, widths)
+        _table(book, "Known-label gaps",
+               ["Verified party", "Unverified party", "Expected party", "Split",
+                "Reason", "Source row", "Verified ID", "Unverified ID"],
+               result["misses"],
+               ["verified_party", "unverified_party", "expected_party", "split",
+                "reason", "source_row", "verified_party_id", "unverified_party_id"],
+               [48, 62, 48, 18, 34, 14, 40, 40])
+        stats = result["metrics"]
+        stat_rows = [
+            {"metric": "Stage", "value": result["stage"]},
+            {"metric": "Eligible unverified rows", "value": stats["eligible_unverified_rows"]},
+            {"metric": "Selected verified parties", "value": stats["selected_verified_parties"]},
+            {"metric": "Candidate pairs", "value": stats["candidate_pairs"]},
+            {"metric": "Strong pairs", "value": stats["strong_pairs"]},
+            {"metric": "Review pairs", "value": stats["review_pairs"]},
+            {"metric": "Dropped pairs", "value": stats["dropped_pairs"]},
+            {"metric": "Known-label candidate gaps", "value": stats["known_label_misses"]},
+            {"metric": "Not retrieved for party", "value": stats["known_label_index_misses"]},
+            {"metric": "Indexed but failed family gate", "value": stats["known_label_gate_exclusions"]},
+            {"metric": "Stage runtime (seconds)", "value": stats["stage_seconds"]},
+            {"metric": "Scope", "value": stats["scope"]},
+            {"metric": "Label audit", "value": stats["label_scope"]},
+        ]
+        _table(book, "Stats", ["Metric", "Value"], stat_rows,
+               ["metric", "value"], [37, 105])
+    finally:
+        book.close()
+    return path

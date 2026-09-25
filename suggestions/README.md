@@ -1,5 +1,47 @@
 # Verified-party-first suggestions
 
+## Full-input independent/final demo (recommended for the nine-party review)
+
+```powershell
+python -m suggestions.family_demo --config config.toml --representatives-file suggestions/demo_representatives.json --output-dir outputs/family_demo_1
+```
+
+This command always indexes **all eligible unverified names once**. It does
+not use the older quick-demo leading-token *input filter* or compare every
+verified party to every unverified row by brute force. The initial workbook
+(`initial/suggestions_current.xlsx`) searches each listed verified party
+independently, so the same unverified name can appear under multiple parties.
+The final workbook (`final/suggestions_current.xlsx`) uses the full verified
+catalog to resolve competing assignments. Both are read-only simulations:
+no events, mappings, or graph state are changed. Use a new output directory
+for each run; existing results are never overwritten.
+
+Each workbook has `Verified parties`, `Strong suggestions`, `Review candidates`,
+`Dropped candidates`, `Known-label gaps`, and `Stats` tabs. The matching
+decision uses the existing enhanced POC rules. A separate, bounded leading-name
+token index adds brand-family *review* leads; it does not by itself create a
+strong match. Nonpreferred OBO/VIA segments and incidental fuzzy index hits
+are not promoted to suggestions. Initial dropped reasons cannot include a
+competing party; final dropped rows can name the party that won instead.
+
+`metrics.json` in each stage contains counts by party, drop reasons, held-out
+exact-party candidate recall, held-out strong precision/recall when labels are
+available, and stage/export runtime. `run_metrics.json` records shared index
+runtime and overall timing. The label audit does not infer that regional or
+brand-related verified names are the same legal entity; it checks only the
+exact party or an already-known graph root. Labels never select candidates or
+change decisions in the new audit; the reused POC matcher still has its
+existing TRAIN/CALIBRATION-based multipart prior when enabled. Initial pair
+counts can overlap between representatives,
+so compare the per-party measures rather than treating initial counts as
+unique unverified rows. The label-gaps tab distinguishes a name not retrieved
+for that verified party from a retrieved hit that failed the family-evidence
+gate. "Not retrieved" means it produced neither an indexed proposal nor a
+leading-name-index hit; it does not mean the name is absent from the input.
+
+The older `snapshot_demo` command below remains for reproducing previous
+quick-demo runs, but it is **not** used by this full-input workflow.
+
 ## Two-snapshot demo: actual verified-name groups, then expanded verified list
 
 Use this when you want to show how suggestions change as more verified names

@@ -148,12 +148,16 @@ def _apply_request_cutoff(decisions: list, party_job: dict, default_job: dict,
 
 
 def _rules_decisions(records: list[PartyRecord], graph: VerifiedGraph, config: dict,
-                     prepared: Path, jobs: list[dict]) -> tuple[list, dict, FeatureScorer, dict]:
+                     prepared: Path, jobs: list[dict],
+                     retriever: MentionRetriever | None = None,
+                     scorer: FeatureScorer | None = None,
+                     candidate_rows_only: bool = False,
+                     extra_candidate_ids: set[str] | None = None) -> tuple[list, dict, FeatureScorer, dict]:
     artifact = Path(config.get("paths", {}).get("artifacts_dir", "artifacts")) / "matcher.joblib"
     # Inference may use an updated verified catalog. The trained ML model is
     # disabled below, so its prepared-data version must not force retraining.
     # Reuse only the existing POC IDF/rules cutoff when the artifact is present.
-    scorer = FeatureScorer(artifact)
+    scorer = scorer or FeatureScorer(artifact)
     scorer.model = scorer.target_model = scorer.calibrator = None
     scorer.system_threshold = float(scorer.artifact.get(
         "rules_system_threshold", config.get("decision", {}).get("fallback_system_threshold", 0.90)))
@@ -165,8 +169,14 @@ def _rules_decisions(records: list[PartyRecord], graph: VerifiedGraph, config: d
     workers = (1 if execution.get("mode") == "serial" else
                max(1, int(execution.get("workers", 10))))
     retrieval_started = time.perf_counter()
-    retriever = MentionRetriever(records, config.get("retrieval", {}), workers=workers)
+    retriever = retriever or MentionRetriever(records, config.get("retrieval", {}), workers=workers)
     proposals, retrieval_stats = collect_proposals(graph, retriever, scorer)
+    if candidate_rows_only:
+        # The one-party demo queries a shared full-population index. Only rows
+        # with an indexed proposal need the expensive decision stages; absent
+        # rows are still included in the separate label-retrieval audit.
+        eligible_ids = set(proposals) | (extra_candidate_ids or set())
+        records = [record for record in records if record.adm_party_id in eligible_ids]
     for record_proposals in proposals.values():
         for proposal in record_proposals:
             proposal.feature_score = proposal.rules_score
