@@ -7,13 +7,13 @@ become available. It reuses the enhanced POC rules, including OBO/VIA, and
 does **not** change the main matcher, saved graph, events, or mappings.
 
 ```powershell
-.\.venv\Scripts\python.exe -m suggestions.snapshot_demo --config config.toml --max-families 3 --output-dir outputs\verified_snapshots_1 --xlsx
+python -m suggestions.snapshot_demo --config config.toml --max-families 3 --output-dir outputs/verified_snapshots_1 --xlsx
 ```
 
 For the nine examples supplied for the demo, use the checked-in list instead:
 
 ```powershell
-.\.venv\Scripts\python.exe -m suggestions.snapshot_demo --config config.toml --representatives-file suggestions\demo_representatives.json --output-dir outputs\listed_snapshots_1 --xlsx
+python -m suggestions.snapshot_demo --config config.toml --representatives-file suggestions/demo_representatives.json --output-dir outputs/listed_snapshots_1 --xlsx
 ```
 
 Every listed name must exactly and uniquely occur in the prepared verified
@@ -65,6 +65,10 @@ false positives and is not a promise of 90% coverage. Strong suggestions
 still use the POC's existing acceptance rules and cutoffs. The `Scenario` sheet
 reports the share of selected names appearing in either strong or review;
 that suggestion coverage is **not** retrieval recall or match accuracy.
+The snapshot demo's `--xlsx` uses the POC's existing Python `XlsxWriter`
+dependency. It does not require Node.js, `@oai/artifact-tool`, or
+`build_workbook.mjs`; that JavaScript file remains for the other suggestions
+commands.
 
 ## Recommended: enhanced POC rules, scoped for a quick run
 

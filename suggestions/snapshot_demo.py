@@ -12,13 +12,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from .current import _export_xlsx
 from .engine import _GENERIC_ANCHORS, name_tokens
 from .poc import _current_graph, _eligible_records, _write_csv, build
+from .simple_workbook import export_snapshot
 from party_matching.domain import load_config, parse_mentions, read_json
 
 
@@ -311,9 +310,6 @@ def main() -> None:
                         help="Score all eligible names in both snapshots (slower); default selects family-token names")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--xlsx", action="store_true")
-    parser.add_argument("--node", help="Node.js executable for XLSX")
-    parser.add_argument("--artifact-modules", type=Path,
-                        help="node_modules containing @oai/artifact-tool for XLSX")
     args = parser.parse_args()
     if args.max_families < 1 or args.min_family_unverified < 1:
         parser.error("--max-families and --min-family-unverified must be positive")
@@ -321,13 +317,6 @@ def main() -> None:
         parser.error("Output directory must be new or empty; existing results are preserved")
     config = load_config(args.config)
     prepared = args.prepared_dir or Path(config.get("paths", {}).get("prepared_dir", "data/prepared"))
-    bundled_node = (Path.home() / ".cache" / "codex-runtimes" /
-                    "codex-primary-runtime" / "dependencies" / "node")
-    bundled_exe = bundled_node / "bin" / ("node.exe" if os.name == "nt" else "node")
-    node = args.node or (str(bundled_exe) if bundled_exe.exists() else shutil.which("node"))
-    modules = args.artifact_modules or (bundled_node / "node_modules")
-    if args.xlsx and (not node or not (modules / "@oai" / "artifact-tool").exists()):
-        parser.error("XLSX requires Node.js and --artifact-modules containing @oai/artifact-tool")
     for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(variable, str(config.get("execution", {}).get("native_threads", 10)))
     try:
@@ -350,9 +339,9 @@ def main() -> None:
     (args.output_dir / "scenario.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     if args.xlsx:
-        _export_xlsx(args.output_dir / "initial", node, modules, *initial)
-        _export_xlsx(args.output_dir / "expanded", node, modules, *expanded, changes=changes,
-                     scenario=manifest)
+        export_snapshot(args.output_dir / "initial", initial)
+        export_snapshot(args.output_dir / "expanded", expanded, changes=changes,
+                        scenario=manifest)
     print(f"Scored the same {manifest['selected_unverified_names']} unverified names in both snapshots")
     print("Selected verified groups: " + ", ".join(
         f"{family['representative']} ({family['anchor']})" for family in manifest["families"]))

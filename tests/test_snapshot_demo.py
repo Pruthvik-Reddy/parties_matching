@@ -2,6 +2,9 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from openpyxl import load_workbook
+
+from suggestions.simple_workbook import export_snapshot
 from suggestions.snapshot_demo import build_snapshots
 from party_matching.domain import load_config
 
@@ -100,3 +103,22 @@ def test_named_list_selects_multiple_real_groups_without_labels():
             "Abbott Laboratories", "Coherent Corp."]
         assert initial[2]["counts"]["unverified_scored"] == expanded[2]["counts"]["unverified_scored"] == 4
         assert not (root / "state").exists()
+        initial_folder = root / "initial"
+        expanded_folder = root / "expanded"
+        initial_folder.mkdir()
+        expanded_folder.mkdir()
+        first_path = export_snapshot(initial_folder, initial)
+        second_path = export_snapshot(expanded_folder, expanded, changes=[], scenario=manifest)
+        first = load_workbook(first_path, read_only=True)
+        try:
+            assert first.sheetnames == ["Verified parties", "Strong suggestions", "Review candidates"]
+        finally:
+            first.close()
+        second = load_workbook(second_path, read_only=True)
+        try:
+            assert second.sheetnames == ["Verified parties", "Strong suggestions",
+                                         "Review candidates", "Changes", "Scenario"]
+            assert second["Scenario"]["A14"].value == "Abbott Laboratories"
+            assert isinstance(second["Scenario"]["B8"].value, (int, float))
+        finally:
+            second.close()
