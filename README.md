@@ -4,6 +4,10 @@ This local POC derives an ADM-shaped dataset from the `related-parties` workbook
 
 For a separate inference-only CSV handoff of the enhanced rules matcher, see [rules_only_handoff/README.md](rules_only_handoff/README.md). It does not require the POC training or reporting workflow.
 
+For separate, read-only verified-party **suggestions** using the enhanced POC
+rules with an optional quick-run scope (not one-to-one matching), see
+[suggestions/README.md](suggestions/README.md).
+
 ## Setup
 
 Use Python 3.9 through 3.12. Start with the core lexical installation; add the optional integrations only after the baseline works. Public Hugging Face models do not require an account. The first model-enabled run downloads weights unless `embedding_model_path` points to a local copy.
