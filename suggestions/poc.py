@@ -152,7 +152,8 @@ def _rules_decisions(records: list[PartyRecord], graph: VerifiedGraph, config: d
                      retriever: MentionRetriever | None = None,
                      scorer: FeatureScorer | None = None,
                      candidate_rows_only: bool = False,
-                     extra_candidate_ids: set[str] | None = None) -> tuple[list, dict, FeatureScorer, dict]:
+                     extra_candidate_ids: set[str] | None = None,
+                     proposals_override: dict | None = None) -> tuple[list, dict, FeatureScorer, dict]:
     artifact = Path(config.get("paths", {}).get("artifacts_dir", "artifacts")) / "matcher.joblib"
     # Inference may use an updated verified catalog. The trained ML model is
     # disabled below, so its prepared-data version must not force retraining.
@@ -170,7 +171,13 @@ def _rules_decisions(records: list[PartyRecord], graph: VerifiedGraph, config: d
                max(1, int(execution.get("workers", 10))))
     retrieval_started = time.perf_counter()
     retriever = retriever or MentionRetriever(records, config.get("retrieval", {}), workers=workers)
-    proposals, retrieval_stats = collect_proposals(graph, retriever, scorer)
+    # Full-catalog suggestions reuse the already-scored retrieval proposals
+    # for independent one-party decisions. None means perform normal retrieval;
+    # an empty dict is intentionally a valid, no-proposal override.
+    if proposals_override is None:
+        proposals, retrieval_stats = collect_proposals(graph, retriever, scorer)
+    else:
+        proposals, retrieval_stats = proposals_override, {"reused_global_proposals": True}
     if candidate_rows_only:
         # The one-party demo queries a shared full-population index. Only rows
         # with an indexed proposal need the expensive decision stages; absent
@@ -189,6 +196,7 @@ def _rules_decisions(records: list[PartyRecord], graph: VerifiedGraph, config: d
     _apply_request_cutoff(baseline, party_job, default_job, scorer, config)
     decisions = baseline
     stages = {"baseline": sum(item.decision == "MATCH" for item in baseline)}
+    stages["retrieval"] = retrieval_stats
     stages["poc_artifact_loaded"] = bool(scorer.artifact)
     if not scorer.artifact:
         stages["artifact_warning"] = (

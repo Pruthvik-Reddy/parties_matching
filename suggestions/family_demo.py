@@ -1,7 +1,7 @@
-"""Two read-only, full-input suggestion snapshots for named verified parties.
+"""Two read-only, full-input suggestion snapshots for verified parties.
 
-Initial searches are independent: each representative is the only verified
-party in its decision graph. Final decisions use the complete catalog. Both
+Initial decisions are independent: each party is the only verified party in
+its decision graph. Final decisions use the complete catalog. Both
 search the same full eligible unverified population; neither uses the old
 leading-token input filter, emits events, or saves graph changes. New audit
 labels are read after decisions. The reused POC matcher retains its existing
@@ -11,6 +11,7 @@ TRAIN/CALIBRATION-based multipart prior when configured.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -22,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from party_matching.domain import load_config, read_json, read_jsonl
+from party_matching.graph import VerifiedGraph
 from party_matching.matching import FeatureScorer, MentionRetriever, _best_per_root, _guard_reason
 
 from .engine import _GENERIC_ANCHORS, name_tokens
@@ -50,9 +52,15 @@ MISS_COLUMNS = (
 )
 
 
-def _representatives(catalog: list[dict], entries: list[dict]) -> list[dict]:
+def _representatives(catalog: list[dict], entries: list[dict] | None) -> list[dict]:
+    # The normal run uses the entire current verified catalog. The old short
+    # list is retained only as an explicit, optional focus for quick reviews.
+    if entries is None:
+        if not catalog:
+            raise ValueError("The prepared verified catalog is empty")
+        return catalog
     if not entries:
-        raise ValueError("The representatives list is empty")
+        raise ValueError("The optional representatives list is empty")
     selected: list[dict] = []
     seen: set[str] = set()
     for entry in entries:
@@ -145,11 +153,42 @@ def _label_index(prepared: Path, eligible_ids: set[str]) -> dict[str, dict]:
             if label.get("scorable") and str(label.get("adm_party_id")) in eligible_ids}
 
 
+def _one_party_graph(full_graph: VerifiedGraph, party: dict) -> VerifiedGraph:
+    """Keep this party's known aliases, but not its catalog competitors."""
+    party_id = str(party["partyId"])
+    graph = VerifiedGraph(full_graph.account_id, full_graph.path, load_existing=False)
+    graph.add_parties([party])
+    graph.nodes[party_id].candidates = list(full_graph.nodes[party_id].candidates)
+    graph._rebuild_indexes()
+    return graph
+
+
+def _proposals_by_owner(proposals: dict[str, list], full_graph: VerifiedGraph,
+                        representatives: list[dict]) -> dict[str, dict[str, list]]:
+    """Partition one bounded full-catalog retrieval by the verified owner."""
+    selected = {str(party["partyId"]) for party in representatives}
+    grouped: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    for adm_id, items in proposals.items():
+        for item in items:
+            owner_id = item.owner_party_id
+            if owner_id not in selected:
+                continue
+            isolated = copy.copy(item)
+            isolated.root_party_id = owner_id
+            isolated.root_party_name = full_graph.nodes[owner_id].party_name
+            # A collision among *other* verified parties does not exist in an
+            # independent initial run. Its final run still sees that collision.
+            isolated.candidate_collision_count = 1
+            grouped[owner_id][adm_id].append(isolated)
+    return {party_id: dict(rows) for party_id, rows in grouped.items()}
+
+
 def _run_stage(stage: str, records: list, prepared: Path, config: dict, jobs: list[dict],
                representatives: list[dict],
                retriever: MentionRetriever, scorer: FeatureScorer,
                postings: dict[str, set[str]], preferred: dict[str, str],
-               labels: dict[str, dict], full_graph) -> dict:
+               labels: dict[str, dict], full_graph,
+               global_result: tuple, initial_by_owner: dict[str, dict[str, list]]) -> dict:
     started = time.perf_counter()
     records_by_id = {record.adm_party_id: record for record in records}
     strong: list[dict] = []
@@ -158,30 +197,83 @@ def _run_stage(stage: str, records: list, prepared: Path, config: dict, jobs: li
     misses: list[dict] = []
     per_party: list[dict] = []
     stage_details: list[dict] = []
+    stage_run_count = 0
+    expected_by_root: dict[str, set[str]] = defaultdict(set)
+    for adm_id, label in labels.items():
+        expected = str(label.get("expected_party_id") or "")
+        if expected in full_graph.nodes:
+            expected_by_root[full_graph.root_id(expected)].add(adm_id)
+    selected_by_id = {str(party["partyId"]): party for party in representatives}
+    display_by_root: dict[str, str] = {}
+    for party in representatives:
+        party_id = str(party["partyId"])
+        root_id = full_graph.root_id(party_id)
+        display_by_root.setdefault(root_id, party_id)
+        if root_id in selected_by_id:
+            display_by_root[root_id] = root_id
 
     # Initial graphs contain *one* party each. The final graph is created once
     # with all verified parties, so final decisions can resolve competition.
-    runs = [(party, _current_graph(prepared, config, str(jobs[0]["accountId"]), [], [party]))
-            for party in representatives] if stage == "initial" else [(None, full_graph)]
+    runs = ((party, _one_party_graph(full_graph, party)) for party in representatives) \
+        if stage == "initial" else ((None, full_graph),)
     for run_party, graph in runs:
         family_ids_for_run = (postings.get(_family_anchor(str(run_party["partyName"])), set())
                               if run_party is not None else None)
-        decisions, proposals, _, stages = _rules_decisions(
-            records, graph, config, prepared, jobs, retriever=retriever, scorer=scorer,
-            candidate_rows_only=(stage == "initial"),
-            extra_candidate_ids=family_ids_for_run)
+        if run_party is None:
+            decisions, proposals, _, stages = global_result
+        else:
+            party_id = str(run_party["partyId"])
+            proposals_for_party = initial_by_owner.get(party_id, {})
+            candidate_record_ids = set(proposals_for_party) | (family_ids_for_run or set())
+            candidate_records = [records_by_id[adm_id] for adm_id in sorted(candidate_record_ids)]
+            # A one-root catalog has no competing fragment roots, so the
+            # multipart chooser cannot alter a result. Skip its repeated
+            # TRAIN/CALIBRATION label scan across thousands of parties.
+            single_config = {**config, "decision": {**config.get("decision", {}),
+                                                    "rules_multipart_enabled": False}}
+            if candidate_records:
+                decisions, proposals, _, stages = _rules_decisions(
+                    candidate_records, graph, single_config, prepared, jobs,
+                    retriever=retriever, scorer=scorer,
+                    proposals_override=proposals_for_party)
+            else:
+                decisions, proposals, stages = [], {}, {"baseline": 0, "retrieval": {"reused_global_proposals": True}}
         decision_by_id = {decision.adm_party_id: decision for decision in decisions}
-        stage_details.append(stages)
+        stage_run_count += 1
+        if len(stage_details) < 20:
+            stage_details.append(stages)
         targets = [run_party] if run_party is not None else representatives
         by_root: dict[str, set[str]] = defaultdict(set)
+        accepted_by_root: dict[str, set[str]] = defaultdict(set)
         target_roots = {graph.root_id(str(party["partyId"])) for party in targets}
         for adm_id, items in proposals.items():
             for root in {item.root_party_id for item in items if item.root_party_id in target_roots}:
                 by_root[root].add(adm_id)
+        for adm_id, decision in decision_by_id.items():
+            if (decision.decision == "MATCH" and decision.verified_party_id in target_roots
+                    and (_record_case(records_by_id[adm_id]) == "PLAIN"
+                         or decision.matched_mention == preferred[adm_id])):
+                accepted_by_root[decision.verified_party_id].add(adm_id)
         for party in targets:
             party_id = str(party["partyId"])
             party_name = str(party["partyName"])
             root_id = graph.root_id(party_id)
+            if stage == "final" and display_by_root[full_graph.root_id(party_id)] != party_id:
+                # The final rules decision names a graph root. Show that root
+                # once, while retaining a visible zero-count row for each
+                # child verified party in the full catalog.
+                per_party.append({
+                    "verified_party": party_name, "verified_party_id": party_id,
+                    "rolled_into": full_graph.nodes[full_graph.root_id(party_id)].party_name,
+                    "eligible_unverified": len(records), "indexed_proposals": 0,
+                    "qualified_index_proposals": 0, "leading_name_hits": 0,
+                    "candidate_pairs": 0, "strong": 0, "review": 0, "dropped": 0,
+                    "known_labels": 0, "known_label_misses": 0,
+                    "known_label_index_misses": 0, "known_label_gate_exclusions": 0,
+                    "held_out_labels": 0, "held_out_candidate_recall": None,
+                    "held_out_strong_precision": None, "held_out_strong_recall": None,
+                })
+                continue
             anchor = _family_anchor(party_name)
             family_ids = postings.get(anchor, set()) if anchor else set()
             proposal_ids = by_root.get(root_id, set())
@@ -190,12 +282,10 @@ def _run_stage(stage: str, records: list, prepared: Path, config: dict, jobs: li
                 if any(_qualified_proposal(item, preferred[adm_id]) for item in
                        proposals.get(adm_id, []) if item.root_party_id == root_id)
             }
-            accepted_ids = {adm_id for adm_id, decision in decision_by_id.items()
-                            if decision.decision == "MATCH" and decision.verified_party_id == root_id
-                            and (_record_case(records_by_id[adm_id]) == "PLAIN"
-                                 or decision.matched_mention == preferred[adm_id])}
+            accepted_ids = accepted_by_root.get(root_id, set())
             candidate_ids = qualified_proposal_ids | family_ids | accepted_ids
             pair_status: dict[str, str] = {}
+            labeled_strong_ids: list[str] = []
             for adm_id in sorted(candidate_ids):
                 record = records_by_id[adm_id]
                 decision = decision_by_id.get(adm_id)
@@ -242,14 +332,14 @@ def _run_stage(stage: str, records: list, prepared: Path, config: dict, jobs: li
                 }
                 {"STRONG": strong, "REVIEW": review, "DROPPED": dropped}[status].append(row)
                 pair_status[adm_id] = status
+                if (status == "STRONG" and adm_id in labels
+                        and labels[adm_id].get("split") in {"TEST_KNOWN", "TEST_UNSEEN"}):
+                    labeled_strong_ids.append(adm_id)
 
             # This label audit runs *after* decisions and covers exact
             # party/root associations, not inferred brand families. The POC's
             # existing multipart prior is a separate TRAIN/CALIBRATION input.
-            expected_ids = {adm_id for adm_id, label in labels.items()
-                            if (expected := str(label.get("expected_party_id") or ""))
-                            and expected in full_graph.nodes
-                            and full_graph.root_id(expected) == full_graph.root_id(party_id)}
+            expected_ids = expected_by_root.get(full_graph.root_id(party_id), set())
             index_miss_ids = expected_ids - (proposal_ids | family_ids)
             gate_miss_ids = (expected_ids - candidate_ids) - index_miss_ids
             for adm_id in sorted(expected_ids - candidate_ids):
@@ -266,13 +356,10 @@ def _run_stage(stage: str, records: list, prepared: Path, config: dict, jobs: li
                 })
             held_out = {adm_id for adm_id in expected_ids if labels[adm_id].get("split") in
                         {"TEST_KNOWN", "TEST_UNSEEN"}}
-            labeled_strong = [row for row in strong if row["verified_party_id"] == party_id
-                              and row["unverified_party_id"] in labels
-                              and labels[row["unverified_party_id"]].get("split") in
-                              {"TEST_KNOWN", "TEST_UNSEEN"}]
-            correct_strong = sum(row["unverified_party_id"] in held_out for row in labeled_strong)
+            correct_strong = sum(adm_id in held_out for adm_id in labeled_strong_ids)
             per_party.append({
                 "verified_party": party_name, "verified_party_id": party_id,
+                "rolled_into": "",
                 "eligible_unverified": len(records),
                 "indexed_proposals": len(proposal_ids),
                 "qualified_index_proposals": len(qualified_proposal_ids),
@@ -287,7 +374,7 @@ def _run_stage(stage: str, records: list, prepared: Path, config: dict, jobs: li
                 "known_label_gate_exclusions": len(gate_miss_ids),
                 "held_out_labels": len(held_out),
                 "held_out_candidate_recall": len(held_out & candidate_ids) / len(held_out) if held_out else None,
-                "held_out_strong_precision": correct_strong / len(labeled_strong) if labeled_strong else None,
+                "held_out_strong_precision": correct_strong / len(labeled_strong_ids) if labeled_strong_ids else None,
                 "held_out_strong_recall": correct_strong / len(held_out) if held_out else None,
             })
 
@@ -311,12 +398,15 @@ def _run_stage(stage: str, records: list, prepared: Path, config: dict, jobs: li
             "drop_reasons": dict(Counter(row["reason"] for row in dropped)),
             "per_verified_party": per_party,
             "rules_stages": stage_details,
+            "rules_stage_runs": stage_run_count,
+            "rules_stages_sampled": stage_run_count > len(stage_details),
             "stage_seconds": time.perf_counter() - started,
         },
     }
 
 
-def build_family_demo(prepared: Path, config: dict, representative_entries: list[dict]) -> tuple[dict, dict, dict]:
+def build_family_demo(prepared: Path, config: dict,
+                      representative_entries: list[dict] | None = None) -> tuple[dict, dict, dict]:
     started = time.perf_counter()
     catalog = read_json(prepared / "verified_parties.json", []) or []
     representatives = _representatives(catalog, representative_entries)
@@ -339,15 +429,29 @@ def build_family_demo(prepared: Path, config: dict, representative_entries: list
     scorer = FeatureScorer(artifact)
     full_graph = _current_graph(prepared, config, account_id, [], catalog)
     labels = _label_index(prepared, {record.adm_party_id for record in records})
+    # Retrieve and score the full catalog once. Reusing its bounded proposals
+    # makes an all-verified independent snapshot feasible; an initial party
+    # still has its own one-root graph and cannot lose to another party at the
+    # decision stage. The leading-name index catches additional review leads.
+    global_result = _rules_decisions(records, full_graph, config, prepared, jobs,
+                                     retriever=retriever, scorer=scorer)
+    initial_by_owner = _proposals_by_owner(global_result[1], full_graph, representatives)
     initial = _run_stage("initial", records, prepared, config, jobs, representatives,
-                         retriever, scorer, postings, preferred, labels, full_graph)
+                         retriever, scorer, postings, preferred, labels, full_graph,
+                         global_result, initial_by_owner)
     final = _run_stage("final", records, prepared, config, jobs, representatives,
-                       retriever, scorer, postings, preferred, labels, full_graph)
+                       retriever, scorer, postings, preferred, labels, full_graph,
+                       global_result, initial_by_owner)
     common = {
         "index_seconds": index_seconds, "total_seconds_before_export": time.perf_counter() - started,
         "indexed_mentions": len(retriever.mentions), "eligible_unverified_rows": len(records),
-        "excluded_rows": dict(excluded), "representatives": [p["partyName"] for p in representatives],
-        "note": "Initial party runs are independent; pair counts may overlap. Final uses the full verified catalog.",
+        "full_catalog_retrieval": global_result[3].get("retrieval", {}),
+        "excluded_rows": dict(excluded), "verified_party_count": len(representatives),
+        "verified_selection": "all_prepared" if representative_entries is None else "named_subset",
+        "representatives": ([p["partyName"] for p in representatives]
+                            if representative_entries is not None else None),
+        "note": "Initial decisions isolate each party using one full-catalog indexed retrieval; "
+                "pair counts may overlap. Final uses the full verified catalog.",
     }
     return initial, final, common
 
@@ -374,7 +478,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
     parser.add_argument("--prepared-dir", type=Path)
     parser.add_argument("--representatives-file", type=Path,
-                        default=Path("suggestions/demo_representatives.json"))
+                        help="Optional named subset for smaller output; omitted means every prepared verified party")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
@@ -384,9 +488,11 @@ def main() -> None:
     for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(variable, str(config.get("execution", {}).get("native_threads", 10)))
     try:
-        entries = json.loads(args.representatives_file.read_text(encoding="utf-8"))
-        if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
-            raise ValueError("--representatives-file must contain a JSON list of {name} objects")
+        entries = None
+        if args.representatives_file is not None:
+            entries = json.loads(args.representatives_file.read_text(encoding="utf-8"))
+            if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+                raise ValueError("--representatives-file must contain a JSON list of {name} objects")
         initial, final, common = build_family_demo(prepared, config, entries)
     except (ValueError, OSError, json.JSONDecodeError) as error:
         parser.error(str(error))
@@ -396,7 +502,8 @@ def main() -> None:
     common["total_seconds_including_export"] = time.perf_counter() - run_started
     (args.output_dir / "run_metrics.json").write_text(
         json.dumps(common, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"All {common['eligible_unverified_rows']:,} eligible unverified rows indexed; no quick-demo filter")
+    print(f"All {common['verified_party_count']:,} selected verified parties and "
+          f"{common['eligible_unverified_rows']:,} eligible unverified rows; no quick-demo filter")
     print(f"Initial: {len(initial['strong']):,} strong, {len(initial['review']):,} review")
     print(f"Final: {len(final['strong']):,} strong, {len(final['review']):,} review")
     print(f"Output: {args.output_dir.resolve()}")

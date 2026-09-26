@@ -84,3 +84,11 @@ def test_full_population_independent_initial_and_audited_final():
             book.close()
         saved = json.loads((folder / "metrics.json").read_text(encoding="utf-8"))
         assert saved["eligible_unverified_rows"] == len(names)
+
+        # Omission of the old representatives file must use every party in
+        # the prepared catalog, including parties with no suggestions.
+        all_initial, all_final, all_common = build_family_demo(prepared, config)
+        assert all_common["verified_selection"] == "all_prepared"
+        assert all_common["verified_party_count"] == len(catalog)
+        assert {row["verified_party_id"] for row in all_initial["parties"]} == {"a", "n", "d", "o"}
+        assert {row["verified_party_id"] for row in all_final["parties"]} == {"a", "n", "d", "o"}

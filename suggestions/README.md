@@ -1,20 +1,36 @@
 # Verified-party-first suggestions
 
-## Full-input independent/final demo (recommended for the nine-party review)
+## Full-input independent/final demo (all verified parties)
 
 ```powershell
-python -m suggestions.family_demo --config config.toml --representatives-file suggestions/demo_representatives.json --output-dir outputs/family_demo_1
+python -m suggestions.family_demo --config config.toml --output-dir outputs/family_demo_1
 ```
 
-This command always indexes **all eligible unverified names once**. It does
-not use the older quick-demo leading-token *input filter* or compare every
-verified party to every unverified row by brute force. The initial workbook
-(`initial/suggestions_current.xlsx`) searches each listed verified party
-independently, so the same unverified name can appear under multiple parties.
-The final workbook (`final/suggestions_current.xlsx`) uses the full verified
-catalog to resolve competing assignments. Both are read-only simulations:
+This command uses **every verified party in the prepared catalog** and indexes
+**all eligible unverified names**. The earlier nine-name representatives file
+is not needed. It does not use the older quick-demo leading-token *input
+filter* or compare every verified party to every unverified row by brute
+force. One full-catalog indexed search is reused for the initial independent
+party decisions; a bounded leading-name index adds review candidates. The
+matcher still has its normal per-name candidate cap, so this is not an
+exhaustive all-pairs search. The initial workbook
+(`initial/suggestions_current.xlsx`) treats each verified party independently,
+so the same unverified name can appear under multiple parties. The final
+workbook (`final/suggestions_current.xlsx`) uses the full verified catalog to
+resolve competing assignments. Verified children already linked to a graph
+root appear as rollups in the final summary instead of duplicating the root's
+suggestions. Both are read-only simulations:
 no events, mappings, or graph state are changed. Use a new output directory
 for each run; existing results are never overwritten.
+
+For a deliberately smaller *output*, `--representatives-file
+suggestions/demo_representatives.json` is still available. It is optional and
+is never generated or expanded automatically. The full-catalog retrieval still
+runs so its candidate context matches the all-party mode.
+The command prints the number of prepared verified parties it actually read.
+If it prints only 10, the local `data/prepared/verified_parties.json` contains
+only 10; the demo does not invent the remaining parties. Prepare the full
+source workbook on that machine before running the all-party command.
 
 Each workbook has `Verified parties`, `Strong suggestions`, `Review candidates`,
 `Dropped candidates`, `Known-label gaps`, and `Stats` tabs. The matching

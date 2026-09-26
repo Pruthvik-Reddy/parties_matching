@@ -11,6 +11,9 @@ from pathlib import Path
 import xlsxwriter
 
 
+EXCEL_DATA_ROWS_PER_SHEET = 1_048_575
+
+
 def _table(book, title: str, headers: list[str], rows: list[dict], keys: list[str],
            widths: list[int], percent_keys: set[str] | None = None,
            percent_row_numbers: set[int] | None = None) -> None:
@@ -136,13 +139,13 @@ def export_family_snapshot(folder: Path, result: dict) -> Path:
     try:
         parties = result["parties"]
         _table(book, "Verified parties",
-               ["Verified party", "Strong", "Review", "Dropped", "Known labels",
+               ["Verified party", "Final rollup", "Strong", "Review", "Dropped", "Known labels",
                 "Not retrieved", "Family-gate exclusions", "Held-out candidate recall", "Held-out strong precision",
                 "Verified ID"], parties,
-               ["verified_party", "strong", "review", "dropped", "known_labels",
+               ["verified_party", "rolled_into", "strong", "review", "dropped", "known_labels",
                 "known_label_index_misses", "known_label_gate_exclusions", "held_out_candidate_recall",
                 "held_out_strong_precision", "verified_party_id"],
-               [48, 14, 14, 14, 16, 20, 24, 24, 24, 40],
+               [48, 48, 14, 14, 14, 16, 20, 24, 24, 24, 40],
                percent_keys={"held_out_candidate_recall", "held_out_strong_precision"})
         detail_headers = ["Verified party", "Unverified party", "Reason", "Rules score",
                           "Lexical score", "Family similarity", "Retrieval source",
@@ -156,14 +159,21 @@ def export_family_snapshot(folder: Path, result: dict) -> Path:
         for title, key in (("Strong suggestions", "strong"),
                            ("Review candidates", "review"),
                            ("Dropped candidates", "dropped")):
-            _table(book, title, detail_headers, result[key], detail_keys, widths)
-        _table(book, "Known-label gaps",
-               ["Verified party", "Unverified party", "Expected party", "Split",
-                "Reason", "Source row", "Verified ID", "Unverified ID"],
-               result["misses"],
-               ["verified_party", "unverified_party", "expected_party", "split",
-                "reason", "source_row", "verified_party_id", "unverified_party_id"],
-               [48, 62, 48, 18, 34, 14, 40, 40])
+            for start in range(0, max(1, len(result[key])), EXCEL_DATA_ROWS_PER_SHEET):
+                number = start // EXCEL_DATA_ROWS_PER_SHEET + 1
+                sheet_title = title if number == 1 else f"{title} {number}"
+                _table(book, sheet_title, detail_headers,
+                       result[key][start:start + EXCEL_DATA_ROWS_PER_SHEET], detail_keys, widths)
+        gap_headers = ["Verified party", "Unverified party", "Expected party", "Split",
+                       "Reason", "Source row", "Verified ID", "Unverified ID"]
+        gap_keys = ["verified_party", "unverified_party", "expected_party", "split",
+                    "reason", "source_row", "verified_party_id", "unverified_party_id"]
+        for start in range(0, max(1, len(result["misses"])), EXCEL_DATA_ROWS_PER_SHEET):
+            number = start // EXCEL_DATA_ROWS_PER_SHEET + 1
+            sheet_title = "Known-label gaps" if number == 1 else f"Known-label gaps {number}"
+            _table(book, sheet_title, gap_headers,
+                   result["misses"][start:start + EXCEL_DATA_ROWS_PER_SHEET],
+                   gap_keys, [48, 62, 48, 18, 34, 14, 40, 40])
         stats = result["metrics"]
         stat_rows = [
             {"metric": "Stage", "value": result["stage"]},
